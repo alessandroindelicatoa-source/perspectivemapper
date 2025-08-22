@@ -1,3 +1,4 @@
+
 import os
 import io
 import re
@@ -396,7 +397,8 @@ results = pd.DataFrame({
     "pca_y": coords[:,1],
 })
 if not bias_df.empty:
-    results = results.merge(bias_df, left_index=True, right_on("doc_id"), how="left").drop(columns=["doc_id"])
+    # FIXED: use right_on="doc_id" (keyword), not right_on("doc_id")
+    results = results.merge(bias_df, left_index=True, right_on="doc_id", how="left").drop(columns=["doc_id"])
 st.write(results)
 
 if want_csv:
