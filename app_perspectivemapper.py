@@ -23,7 +23,6 @@ import stopwordsiso as stopwordsiso
 from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
 
-# Sentiment
 cardiff_error = None
 try:
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -40,7 +39,6 @@ except Exception as e:
 
 st.set_page_config(page_title="PerspectiveMapper v2", page_icon="🧭", layout="wide")
 
-# Password gate
 def gate():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
@@ -127,12 +125,16 @@ for d in docs:
     lem=lemmatize(text, d["lang"])
     cleaned.append(lem)
 
-# WordCloud
+# WordCloud patched
 st.subheader("☁️ WordCloud (all docs)")
-wc=WordCloud(width=1000,height=600,background_color="white").generate(" ".join(cleaned))
-fig,ax=plt.subplots(figsize=(10,6))
-ax.imshow(wc, interpolation="bilinear"); ax.axis("off")
-st.pyplot(fig)
+joined_text = " ".join(cleaned).strip()
+if joined_text:
+    wc=WordCloud(width=1000,height=600,background_color="white").generate(joined_text)
+    fig,ax=plt.subplots(figsize=(10,6))
+    ax.imshow(wc, interpolation="bilinear"); ax.axis("off")
+    st.pyplot(fig)
+else:
+    st.warning("No words available for WordCloud (documents may be empty after preprocessing).")
 
 # LDA
 st.subheader("🧵 LDA Topics")
@@ -147,7 +149,7 @@ for i, comp in enumerate(lda.components_):
     topics.append({"topic":i,"words":", ".join(top)})
 st.write(pd.DataFrame(topics))
 
-# BERTopic (with umap_model=None)
+# BERTopic
 st.subheader("🔎 BERTopic")
 try:
     embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
@@ -159,7 +161,7 @@ try:
 except Exception as e:
     st.error(f"BERTopic failed: {e}")
 
-# Embeddings + PCA
+# PCA + Similarity
 st.subheader("🧭 PCA Clustering & Similarity")
 embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 embeddings=embedder.encode([d["text"] for d in docs])
@@ -204,7 +206,7 @@ else:
         scores.append(comp)
     st.write(pd.DataFrame({"file":[d["file"] for d in docs],"sentiment":labels,"score":scores}))
 
-# Narrative Quadrant Mapping
+# Narrative Quadrant
 st.subheader("🗺 Narrative Quadrant Mapping")
 if len(texts)>0:
     tone=[s if isinstance(s,(int,float)) else 0 for s in scores]
@@ -213,7 +215,6 @@ if len(texts)>0:
     fig=px.scatter(dfq,x="tone",y="orient",text="file")
     st.plotly_chart(fig)
 
-# Export CSV
 st.subheader("⬇️ Export")
 results=pd.DataFrame({"file":[d["file"] for d in docs],"lang":[d["lang"] for d in docs]})
 st.download_button("Download CSV",data=results.to_csv(index=False).encode("utf-8"),file_name="results.csv")
