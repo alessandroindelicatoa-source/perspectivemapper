@@ -22,7 +22,9 @@ import stopwordsiso as stopwordsiso
 from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
 
-# Sentiment
+# ----------------------------
+# Sentiment models
+# ----------------------------
 try:
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
     import torch
@@ -30,7 +32,7 @@ try:
     _cardiff_tokenizer = AutoTokenizer.from_pretrained(CARDIFF_MODEL_NAME)
     _cardiff_model = AutoModelForSequenceClassification.from_pretrained(CARDIFF_MODEL_NAME)
     _use_cardiff = True
-except Exception as e:
+except Exception:
     _use_cardiff = False
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
     _vader_analyzer = SentimentIntensityAnalyzer()
@@ -66,6 +68,7 @@ gate()
 # SIDEBAR
 # ----------------------------
 st.sidebar.header("⚙️ Settings")
+demo_mode = st.sidebar.checkbox("Use demo texts", value=False)
 uploads = st.sidebar.file_uploader("Upload .txt/.docx", type=["txt","docx"], accept_multiple_files=True)
 lang_codes = st.sidebar.multiselect("Stopword languages", ["en","es","it","fr","de","pt"], default=["en","es"])
 extra_sw = st.sidebar.text_area("Extra stopwords (comma-separated)", value="and,the,of,to")
@@ -102,15 +105,154 @@ def lemmatize(text, lang="en"):
     try:
         nlp = spacy.blank("es" if lang.startswith("es") else "en")
         doc = nlp(text)
-        return " ".join([t.lemma_ for t in doc])
+        return " ".join([t.lemma_ if t.lemma_ else t.text for t in doc])
     except:
         return text
 
 # ----------------------------
-# LOAD DOCS
+# LOAD DOCS (or demo)
 # ----------------------------
-if not uploads:
-    st.info("⬅️ Upload docs to begin")
+docs=[]
+if demo_mode:
+    demo_texts=[
+        ("doc1.txt","Migration and climate change are important topics in Europe."),
+        ("doc2.txt","Tourism, economy, and gender equality are recurring themes in politics."),
+        ("doc3.txt","Religion and national identity often influence migration discourses.")
+    ]
+    for fn,txt in demo_texts:
+        docs.append({"file":fn,"text":txt,"lang":guess_lang(txt)})
+else:
+    if not uploads:
+        st.info("⬅️ Upload docs or enable demo mode")
+        st.stop()
+    for up in uploads:
+        text=read_file(up)
+        lang=guess_lang(text)
+        docs.append({"file":up.name,"text":text,"lang":lang})
+
+st.success(f"{len(docs)} docs loaded")
+st.write(pd.DataFrame([{"file":d["file"],"lang":d["lang"],"chars":len(d["text"])} for d in docs]))
+
+extra_list = [w.strip() for w in extra_sw.split(",")]
+stop_set=collect_stopwords(lang_codes, extra_list)
+
+cleaned=[]
+for d in docs:
+    toks=[t for t in tokenize(d["text"]) if t not in stop_set]
+    text=" ".join(toks)
+    lem=lemmatize(text, d["lang"])
+    cleaned.append(lem)
+
+joined_text=" ".join(cleaned).strip()
+
+# ----------------------------
+# WORDCLOUD
+# ----------------------------
+st.subheader("☁️ WordCloud (all docs)")
+if len(joined_text.split())>5:
+    wc=WordCloud(width=1000,height=600,background_color="white").generate(joined_text)
+    fig,ax=plt.subplots(figsize=(10,6))
+    ax.imshow(wc, interpolation="bilinear"); ax.axis("off")
+    st.pyplot(fig)
+else:
+    st.warning("Not enough words for WordCloud.")
+
+# ----------------------------
+# LDA
+# ----------------------------
+st.subheader("🧵 LDA Topics")
+if len(joined_text.split())>20:
+    try:
+        vectorizer=CountVectorizer(max_features=3000)
+        X=vectorizer.fit_transform(cleaned)
+        lda=LatentDirichletAllocation(n_components=n_topics,random_state=42)
+        W=lda.fit_transform(X)
+        feature_names=vectorizer.get_feature_names_out()
+        topics=[]
+        for i, comp in enumerate(lda.components_):
+            top=[feature_names[j] for j in comp.argsort()[-10:][::-1]]
+            topics.append({"topic":i,"words":", ".join(top)})
+        st.write(pd.DataFrame(topics))
+    except Exception as e:
+        st.warning(f"LDA could not run: {e}")
+else:
+    st.warning("Need more tokens for LDA (try longer texts).")
+
+# ----------------------------
+# BERTopic
+# ----------------------------
+st.subheader("🔎 BERTopic")
+if len(docs)>=5 and len(joined_text.split())>30:
+    try:
+        embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        bertopic_model=BERTopic(embedding_model=embedder, umap_model=None)
+        topics_bt, probs=bertopic_model.fit_transform(cleaned)
+        st.write(pd.DataFrame({"file":[d["file"] for d in docs],"topic":topics_bt}))
+        fig=bertopic_model.visualize_barchart(top_n_topics=5)
+        st.components.v1.html(fig.to_html(), height=600)
+    except Exception as e:
+        st.error(f"BERTopic failed: {e}")
+else:
+    st.info("Need ≥5 docs and richer text for BERTopic.")
+
+# ----------------------------
+# PCA + SIMILARITY
+# ----------------------------
+st.subheader("🧭 PCA Clustering & Similarity")
+embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+embeddings=embedder.encode([d["text"] for d in docs])
+if len(docs)<2:
+    st.warning("Need ≥2 docs for PCA/Similarity")
+    coords=np.zeros((len(docs),2)); clusters=np.zeros(len(docs),dtype=int)
+else:
+    pca=PCA(n_components=2)
+    coords=pca.fit_transform(embeddings)
+    clusters=np.arange(len(docs))
+df_plot=pd.DataFrame({"x":coords[:,0],"y":coords[:,1],"file":[d["file"] for d in docs],"cluster":clusters})
+fig=px.scatter(df_plot,x="x",y="y",text="file",color="cluster")
+st.plotly_chart(fig)
+sim=cosine_similarity(embeddings)
+heat=ff.create_annotated_heatmap(z=sim,x=[d["file"] for d in docs],y=[d["file"] for d in docs],colorscale="Viridis")
+st.plotly_chart(heat)
+
+# ----------------------------
+# SENTIMENT
+# ----------------------------
+st.subheader("💬 Sentiment")
+texts=[d["text"] for d in docs]
+if use_cardiff and _use_cardiff:
+    labels=[];scores=[]
+    for t in texts:
+        inputs=_cardiff_tokenizer(t,return_tensors="pt",truncation=True,max_length=256)
+        with torch.no_grad():
+            outputs=_cardiff_model(**inputs)
+            probs=torch.nn.functional.softmax(outputs.logits,dim=-1).cpu().numpy()[0]
+        idx=int(np.argmax(probs))
+        label={0:"negative",1:"neutral",2:"positive"}[idx]
+        labels.append(label); scores.append(float(probs[idx]))
+    st.write(pd.DataFrame({"file":[d["file"] for d in docs],"sentiment":labels,"conf":scores}))
+else:
+    labels=[];scores=[]
+    an=SentimentIntensityAnalyzer()
+    for t in texts:
+        res=an.polarity_scores(t)
+        comp=res["compound"]
+        if comp>=0.05: labels.append("positive")
+        elif comp<=-0.05: labels.append("negative")
+        else: labels.append("neutral")
+        scores.append(comp)
+    st.write(pd.DataFrame({"file":[d["file"] for d in docs],"sentiment":labels,"score":scores}))
+
+# ----------------------------
+# EXPORT
+# ----------------------------
+st.subheader("⬇️ Export")
+results=pd.DataFrame({
+    "file":[d["file"] for d in docs],
+    "lang":[d["lang"] for d in docs],
+    "tokens":[len(t.split()) for t in cleaned]
+})
+st.download_button("Download CSV",data=results.to_csv(index=False).encode("utf-8"),file_name="results.csv")
     st.stop()
 
 docs=[]
