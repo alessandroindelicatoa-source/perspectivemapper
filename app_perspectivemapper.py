@@ -136,18 +136,24 @@ if joined_text:
 else:
     st.warning("No words available for WordCloud (documents may be empty after preprocessing).")
 
-# LDA
+# LDA patched
 st.subheader("🧵 LDA Topics")
-vectorizer=CountVectorizer(max_features=3000)
-X=vectorizer.fit_transform(cleaned)
-lda=LatentDirichletAllocation(n_components=n_topics,random_state=42)
-W=lda.fit_transform(X)
-feature_names=vectorizer.get_feature_names_out()
-topics=[]
-for i, comp in enumerate(lda.components_):
-    top=[feature_names[j] for j in comp.argsort()[-10:][::-1]]
-    topics.append({"topic":i,"words":", ".join(top)})
-st.write(pd.DataFrame(topics))
+if joined_text:
+    vectorizer=CountVectorizer(max_features=3000)
+    try:
+        X=vectorizer.fit_transform(cleaned)
+        lda=LatentDirichletAllocation(n_components=n_topics,random_state=42)
+        W=lda.fit_transform(X)
+        feature_names=vectorizer.get_feature_names_out()
+        topics=[]
+        for i, comp in enumerate(lda.components_):
+            top=[feature_names[j] for j in comp.argsort()[-10:][::-1]]
+            topics.append({"topic":i,"words":", ".join(top)})
+        st.write(pd.DataFrame(topics))
+    except Exception as e:
+        st.warning(f"LDA could not run: {e}")
+else:
+    st.warning("No vocabulary available for LDA (documents may be empty or only contain stopwords).")
 
 # BERTopic
 st.subheader("🔎 BERTopic")
