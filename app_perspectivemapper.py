@@ -1,4 +1,3 @@
-
 import os, re, json
 import numpy as np
 import pandas as pd
@@ -24,7 +23,6 @@ from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
 
 # Sentiment
-cardiff_error = None
 try:
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
     import torch
@@ -33,20 +31,21 @@ try:
     _cardiff_model = AutoModelForSequenceClassification.from_pretrained(CARDIFF_MODEL_NAME)
     _use_cardiff = True
 except Exception as e:
-    cardiff_error = str(e)
     _use_cardiff = False
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
     _vader_analyzer = SentimentIntensityAnalyzer()
 
 st.set_page_config(page_title="PerspectiveMapper v2", page_icon="🧭", layout="wide")
 
-# Password gate
+# ----------------------------
+# LOGIN
+# ----------------------------
 def gate():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
     if st.session_state.authenticated:
         return True
-    st.title("🔐 PerspectiveMapper v2 – Access")
+    st.title("🔐 PerspectiveMapper – Access")
     user = st.text_input("Username")
     pwd = st.text_input("Password", type="password")
     if st.button("Log in"):
@@ -63,6 +62,9 @@ def gate():
 
 gate()
 
+# ----------------------------
+# SIDEBAR
+# ----------------------------
 st.sidebar.header("⚙️ Settings")
 uploads = st.sidebar.file_uploader("Upload .txt/.docx", type=["txt","docx"], accept_multiple_files=True)
 lang_codes = st.sidebar.multiselect("Stopword languages", ["en","es","it","fr","de","pt"], default=["en","es"])
@@ -70,6 +72,9 @@ extra_sw = st.sidebar.text_area("Extra stopwords (comma-separated)", value="and,
 n_topics = st.sidebar.slider("LDA topics",2,12,5)
 use_cardiff = st.sidebar.checkbox("Use CardiffNLP sentiment", value=True)
 
+# ----------------------------
+# HELPERS
+# ----------------------------
 def read_file(upload):
     if upload.name.lower().endswith(".txt"):
         return upload.read().decode("utf-8", errors="ignore")
@@ -95,17 +100,17 @@ def tokenize(text):
 
 def lemmatize(text, lang="en"):
     try:
-        if lang.startswith("es"):
-            nlp = spacy.blank("es")
-        else:
-            nlp = spacy.blank("en")
+        nlp = spacy.blank("es" if lang.startswith("es") else "en")
         doc = nlp(text)
         return " ".join([t.lemma_ for t in doc])
     except:
         return text
 
+# ----------------------------
+# LOAD DOCS
+# ----------------------------
 if not uploads:
-    st.info("Upload docs to begin.")
+    st.info("⬅️ Upload docs to begin")
     st.stop()
 
 docs=[]
@@ -127,42 +132,64 @@ for d in docs:
     lem=lemmatize(text, d["lang"])
     cleaned.append(lem)
 
-# WordCloud (without empty check)
+joined_text=" ".join(cleaned).strip()
+
+# ----------------------------
+# WORDCLOUD
+# ----------------------------
 st.subheader("☁️ WordCloud (all docs)")
-wc=WordCloud(width=1000,height=600,background_color="white").generate(" ".join(cleaned))
-fig,ax=plt.subplots(figsize=(10,6))
-ax.imshow(wc, interpolation="bilinear"); ax.axis("off")
-st.pyplot(fig)
+if joined_text:
+    wc=WordCloud(width=1000,height=600,background_color="white").generate(joined_text)
+    fig,ax=plt.subplots(figsize=(10,6))
+    ax.imshow(wc, interpolation="bilinear"); ax.axis("off")
+    st.pyplot(fig)
+else:
+    st.warning("No words available for WordCloud.")
 
+# ----------------------------
 # LDA
+# ----------------------------
 st.subheader("🧵 LDA Topics")
-vectorizer=CountVectorizer(max_features=3000)
-X=vectorizer.fit_transform(cleaned)
-lda=LatentDirichletAllocation(n_components=n_topics,random_state=42)
-W=lda.fit_transform(X)
-feature_names=vectorizer.get_feature_names_out()
-topics=[]
-for i, comp in enumerate(lda.components_):
-    top=[feature_names[j] for j in comp.argsort()[-10:][::-1]]
-    topics.append({"topic":i,"words":", ".join(top)})
-st.write(pd.DataFrame(topics))
+if joined_text:
+    try:
+        vectorizer=CountVectorizer(max_features=3000)
+        X=vectorizer.fit_transform(cleaned)
+        lda=LatentDirichletAllocation(n_components=n_topics,random_state=42)
+        W=lda.fit_transform(X)
+        feature_names=vectorizer.get_feature_names_out()
+        topics=[]
+        for i, comp in enumerate(lda.components_):
+            top=[feature_names[j] for j in comp.argsort()[-10:][::-1]]
+            topics.append({"topic":i,"words":", ".join(top)})
+        st.write(pd.DataFrame(topics))
+    except Exception as e:
+        st.warning(f"LDA could not run: {e}")
+else:
+    st.warning("No vocabulary for LDA.")
 
+# ----------------------------
 # BERTopic
+# ----------------------------
 st.subheader("🔎 BERTopic")
-embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-bertopic_model=BERTopic(embedding_model=embedder, umap_model=None)
-topics_bt, probs=bertopic_model.fit_transform(cleaned)
-st.write(pd.DataFrame({"file":[d["file"] for d in docs],"topic":topics_bt}))
-fig=bertopic_model.visualize_barchart(top_n_topics=5)
-st.components.v1.html(fig.to_html(), height=600)
+try:
+    embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+    bertopic_model=BERTopic(embedding_model=embedder, umap_model=None)
+    topics_bt, probs=bertopic_model.fit_transform(cleaned)
+    st.write(pd.DataFrame({"file":[d["file"] for d in docs],"topic":topics_bt}))
+    fig=bertopic_model.visualize_barchart(top_n_topics=5)
+    st.components.v1.html(fig.to_html(), height=600)
+except Exception as e:
+    st.error(f"BERTopic failed: {e}")
 
-# PCA + Similarity
+# ----------------------------
+# PCA + SIMILARITY
+# ----------------------------
 st.subheader("🧭 PCA Clustering & Similarity")
+embedder = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
 embeddings=embedder.encode([d["text"] for d in docs])
 if len(docs)<2:
-    st.warning("Need at least 2 docs for PCA/Similarity")
-    coords=np.zeros((len(docs),2))
-    clusters=np.zeros(len(docs),dtype=int)
+    st.warning("Need ≥2 docs for PCA/Similarity")
+    coords=np.zeros((len(docs),2)); clusters=np.zeros(len(docs),dtype=int)
 else:
     pca=PCA(n_components=2)
     coords=pca.fit_transform(embeddings)
@@ -174,7 +201,9 @@ sim=cosine_similarity(embeddings)
 heat=ff.create_annotated_heatmap(z=sim,x=[d["file"] for d in docs],y=[d["file"] for d in docs],colorscale="Viridis")
 st.plotly_chart(heat)
 
-# Sentiment
+# ----------------------------
+# SENTIMENT
+# ----------------------------
 st.subheader("💬 Sentiment")
 texts=[d["text"] for d in docs]
 if use_cardiff and _use_cardiff:
@@ -200,15 +229,9 @@ else:
         scores.append(comp)
     st.write(pd.DataFrame({"file":[d["file"] for d in docs],"sentiment":labels,"score":scores}))
 
-# Narrative Quadrant
-st.subheader("🗺 Narrative Quadrant Mapping")
-if len(texts)>0:
-    tone=[s if isinstance(s,(int,float)) else 0 for s in scores]
-    orient=np.random.uniform(-1,1,len(texts))
-    dfq=pd.DataFrame({"tone":tone,"orient":orient,"file":[d["file"] for d in docs]})
-    fig=px.scatter(dfq,x="tone",y="orient",text="file")
-    st.plotly_chart(fig)
-
+# ----------------------------
+# EXPORT
+# ----------------------------
 st.subheader("⬇️ Export")
 results=pd.DataFrame({"file":[d["file"] for d in docs],"lang":[d["lang"] for d in docs]})
 st.download_button("Download CSV",data=results.to_csv(index=False).encode("utf-8"),file_name="results.csv")
