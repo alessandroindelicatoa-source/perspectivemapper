@@ -328,13 +328,12 @@ results = pd.DataFrame({
     "file":[d["filename"] for d in docs],
     "language":[d["lang"] for d in docs],
     "tokens_len":[len(c.split()) for c in cleaned],
-    "sentiment_label":labels,
-    "sentiment_score":scores,
     "lda_dominant_topic":dominant_topic,
     "cluster":clusters,
     "pca_x":coords[:,0],
     "pca_y":coords[:,1]
 })
+
 if not bias_df.empty:
     results = results.merge(bias_df, left_index=True, right_on="doc_id", how="left").drop(columns=["doc_id"])
 st.write(results)
