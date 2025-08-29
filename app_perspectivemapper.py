@@ -299,6 +299,30 @@ clusters = np.zeros(n_docs, dtype=int) if k_for_fit<2 else KMeans(n_clusters=k_f
 df_plot["cluster"] = clusters
 st.plotly_chart(px.scatter(df_plot, x="x", y="y", text="file", color="cluster"), use_container_width=True)
 
+# ----------------------------
+# Hierarchical Clustering Dendrogram
+# ----------------------------
+import scipy.cluster.hierarchy as sch
+from scipy.spatial.distance import pdist
+
+st.subheader("🌳 Cluster Dendrogram (hierarchical clustering)")
+
+# Use cosine distance between embeddings
+dist_matrix = pdist(embeddings, metric="cosine")
+linkage = sch.linkage(dist_matrix, method="ward")
+
+fig, ax = plt.subplots(figsize=(8, 5))
+sch.dendrogram(
+    linkage,
+    labels=[d["filename"] for d in docs],
+    orientation="top",
+    leaf_rotation=45,
+    leaf_font_size=10,
+    ax=ax,
+)
+st.pyplot(fig)
+
+
 # Similarity
 st.subheader("🔗 Similarity matrix")
 sim = cosine_similarity(embeddings)
