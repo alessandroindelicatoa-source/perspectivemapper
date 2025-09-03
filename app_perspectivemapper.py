@@ -384,5 +384,4 @@ if want_csv:
     st.download_button(
         "⬇ Download CSV",
         data=results.to_csv(index=False).encode("utf-8"),
-        file_name="perspectivemapper_results.csv"
-    )
+        file_name="perspectivemapper_results.csv")
