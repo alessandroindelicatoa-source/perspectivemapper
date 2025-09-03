@@ -6,6 +6,7 @@ sentence-transformers
 transformers
 torch
 python-docx
+pdfplumber
 wordcloud
 matplotlib
 plotly
