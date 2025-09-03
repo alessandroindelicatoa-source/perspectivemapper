@@ -214,7 +214,7 @@ gate()  # require password
 c1, c2 = st.columns([1,4])
 with c1:
     logo_candidates = [
-        Path(_file_).parent / "assets" / "logo.png",
+        Path(__file__).parent / "assets" / "logo.png",
         Path.cwd() / "assets" / "logo.png",
         "assets/logo.png",
     ]
