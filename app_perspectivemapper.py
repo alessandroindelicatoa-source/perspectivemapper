@@ -31,7 +31,6 @@ import plotly.figure_factory as ff
 
 # File handling
 from docx import Document as DocxDocument  # python-docx
-import pdfplumber  # <-- added for PDFs
 
 # Sentence embeddings
 import warnings
@@ -120,21 +119,12 @@ def preprocess_docs(docs: List[Dict], stop_set: set) -> List[str]:
     return cleaned
 
 def read_file(upload) -> str:
-    """Handles txt, docx, pdf"""
     name = upload.name.lower()
     if name.endswith(".txt"):
         return upload.read().decode("utf-8", errors="ignore")
     elif name.endswith(".docx"):
         doc = DocxDocument(upload)
         return "\n".join([p.text for p in doc.paragraphs])
-    elif name.endswith(".pdf"):
-        text = ""
-        with pdfplumber.open(upload) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text + "\n"
-        return text
     else:
         return ""
 
@@ -238,12 +228,8 @@ with c2:
     st.write("Discourse analysis: topics, sentiment, similarity, and bias.")
 
 # Sidebar
-st.sidebar.header("⚙ Settings")
-uploads = st.sidebar.file_uploader(
-    "Upload .txt, .docx, or .pdf files",
-    type=["txt","docx","pdf"],
-    accept_multiple_files=True
-)
+st.sidebar.header("⚙️ Settings")
+uploads = st.sidebar.file_uploader("Upload .txt or .docx files", type=["txt","docx"], accept_multiple_files=True)
 lang_codes = st.sidebar.multiselect("Stopword languages", ["en","es","it","fr","de","pt","ca","eu","gl"], default=["en","es","it"])
 extra_sw = st.sidebar.text_area("Extra stopwords (comma-separated)", value="and, the, of, to")
 show_wc = st.sidebar.checkbox("Show WordCloud per document", value=True)
@@ -261,7 +247,7 @@ want_csv = st.sidebar.checkbox("Enable CSV download", value=True)
 
 # Main
 if not uploads:
-    st.info("⬅ Upload one or more files to begin the analysis.")
+    st.info("⬅️ Upload one or more files to begin the analysis.")
     st.stop()
 
 docs = []
@@ -277,9 +263,9 @@ cleaned = preprocess_docs(docs, stop_set)
 
 # WordClouds
 if show_wc:
-    st.subheader("☁ WordCloud per document")
+    st.subheader("☁️ WordCloud per document")
     for d, text in zip(docs, cleaned):
-        st.markdown(f"{d['filename']}")
+        st.markdown(f"**{d['filename']}**")
         if text.strip():
             make_wordcloud(text)
         else:
@@ -307,24 +293,24 @@ else:
     pca = PCA(n_components=n_comp, random_state=42)
     coords_pca = pca.fit_transform(embeddings)
     coords = coords_pca if coords_pca.shape[1] == 2 else np.hstack([coords_pca, np.zeros((n_docs,1))])
-df_plot = pd.DataFrame({
-    "x": coords[:,0],
-    "y": coords[:,1],
-    "file":[d["filename"] for d in docs],
-    "topic":[f"T{t}" for t in dominant_topic]
-})
+df_plot = pd.DataFrame({"x": coords[:,0],"y": coords[:,1],"file":[d["filename"] for d in docs],"topic":[f"T{t}" for t in dominant_topic]})
 k_for_fit = min(max(1, n_clusters), n_docs)
 clusters = np.zeros(n_docs, dtype=int) if k_for_fit<2 else KMeans(n_clusters=k_for_fit, random_state=42, n_init="auto").fit_predict(coords)
 df_plot["cluster"] = clusters
 st.plotly_chart(px.scatter(df_plot, x="x", y="y", text="file", color="cluster"), use_container_width=True)
 
+# ----------------------------
 # Hierarchical Clustering Dendrogram
+# ----------------------------
 import scipy.cluster.hierarchy as sch
 from scipy.spatial.distance import pdist
 
 st.subheader("🌳 Cluster Dendrogram (hierarchical clustering)")
+
+# Use cosine distance between embeddings
 dist_matrix = pdist(embeddings, metric="cosine")
 linkage = sch.linkage(dist_matrix, method="ward")
+
 fig, ax = plt.subplots(figsize=(8, 5))
 sch.dendrogram(
     linkage,
@@ -336,16 +322,11 @@ sch.dendrogram(
 )
 st.pyplot(fig)
 
+
 # Similarity
 st.subheader("🔗 Similarity matrix")
 sim = cosine_similarity(embeddings)
-heatmap = ff.create_annotated_heatmap(
-    z=sim,
-    x=[d["filename"] for d in docs],
-    y=[d["filename"] for d in docs],
-    showscale=True,
-    colorscale="Viridis"
-)
+heatmap = ff.create_annotated_heatmap(z=sim,x=[d["filename"] for d in docs],y=[d["filename"] for d in docs],showscale=True,colorscale="Viridis")
 st.plotly_chart(heatmap, use_container_width=True)
 
 # Sentiment
@@ -376,12 +357,10 @@ results = pd.DataFrame({
     "pca_x":coords[:,0],
     "pca_y":coords[:,1]
 })
+
 if not bias_df.empty:
     results = results.merge(bias_df, left_index=True, right_on="doc_id", how="left").drop(columns=["doc_id"])
 st.write(results)
 
 if want_csv:
-    st.download_button(
-        "⬇ Download CSV",
-        data=results.to_csv(index=False).encode("utf-8"),
-        file_name="perspectivemapper_results.csv")
+    st.download_button("⬇️ Download CSV", data=results.to_csv(index=False).encode("utf-8"), file_name="perspectivemapper_results.csv")
