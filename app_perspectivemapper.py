@@ -69,7 +69,7 @@ except Exception as e:
 
 # PDF support
 try:
-    import PyPDF2
+    import pdfplumber
     _pdf_available = True
 except ImportError:
     _pdf_available = False
@@ -172,16 +172,18 @@ def read_docx_file(upload) -> str:
 
 
 def read_pdf_file(upload) -> str:
-    """Read PDF file"""
+    """Read PDF file using pdfplumber"""
     if not _pdf_available:
-        st.warning("PyPDF2 not installed. Cannot read PDF files.")
+        st.warning("pdfplumber not installed. Cannot read PDF files.")
         return ""
     try:
-        pdf_reader = PyPDF2.PdfReader(upload)
-        text = ""
-        for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
-        return text
+        with pdfplumber.open(upload) as pdf:
+            text = ""
+            for page in pdf.pages:
+                extracted = page.extract_text()
+                if extracted:
+                    text += extracted + "\n"
+            return text
     except Exception as e:
         st.warning(f"Error reading PDF file: {e}")
         return ""
