@@ -39,15 +39,10 @@ from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
 
 # Download NLTK stopwords data on first run
-@st.cache_resource
-def setup_nltk():
-    """Initialize NLTK data"""
-    try:
-        nltk_stopwords.words('english')
-    except LookupError:
-        with st.spinner("Downloading language data..."):
-            nltk.download('stopwords', quiet=True)
-    return True
+try:
+    nltk_stopwords.words('english')
+except LookupError:
+    nltk.download('stopwords', quiet=True)
 
 # WordCloud & Viz
 from wordcloud import WordCloud
@@ -137,7 +132,6 @@ def guess_lang(text: str) -> str:
 
 def collect_stopwords(selected_langs: List[str], extra_stop: List[str]) -> set:
     """Collect stopwords from multiple languages using NLTK"""
-    setup_nltk()  # Ensure NLTK data is available
     sw = set()
     # Map language codes to NLTK language names
     lang_map = {
@@ -386,9 +380,6 @@ def calculate_tfidf_analysis(cleaned: List[str], feature_names: List[str]) -> pd
 # ========================================
 # MAIN APP
 # ========================================
-# Initialize NLTK
-setup_nltk()
-
 gate()  # Require password
 
 # Header
