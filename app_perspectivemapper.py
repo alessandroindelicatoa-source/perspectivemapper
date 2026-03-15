@@ -32,10 +32,17 @@ from sklearn.decomposition import LatentDirichletAllocation
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import StandardScaler
 
-# Tokenization & Stopwords
-import stopwordsiso
+# Tokenization & Stopwords - Using NLTK for Python 3.13+ compatibility
+import nltk
+from nltk.corpus import stopwords as nltk_stopwords
 from langdetect import detect, DetectorFactory
 DetectorFactory.seed = 0
+
+# Download NLTK stopwords data on first run
+try:
+    nltk_stopwords.words('english')
+except LookupError:
+    nltk.download('stopwords', quiet=True)
 
 # WordCloud & Viz
 from wordcloud import WordCloud
@@ -124,13 +131,29 @@ def guess_lang(text: str) -> str:
 
 
 def collect_stopwords(selected_langs: List[str], extra_stop: List[str]) -> set:
-    """Collect stopwords from multiple languages"""
+    """Collect stopwords from multiple languages using NLTK"""
     sw = set()
+    # Map language codes to NLTK language names
+    lang_map = {
+        'en': 'english',
+        'es': 'spanish',
+        'it': 'italian',
+        'fr': 'french',
+        'de': 'german',
+        'pt': 'portuguese',
+        'nl': 'dutch',
+        'ru': 'russian',
+        'ar': 'arabic'
+    }
+    
     for lang in selected_langs:
         try:
-            sw |= set(stopwordsiso.stopwords(lang))
+            nltk_lang = lang_map.get(lang, lang)
+            sw |= set(nltk_stopwords.words(nltk_lang))
         except Exception:
+            # If language not available, skip it
             pass
+    
     sw |= set([w.strip().lower() for w in extra_stop if w.strip()])
     sw |= set(["http", "https", "www", "com", "url", "link"])
     return sw
@@ -402,7 +425,7 @@ uploads = st.sidebar.file_uploader(
 st.sidebar.subheader("Analysis Options")
 lang_codes = st.sidebar.multiselect(
     "Stopword languages",
-    ["en", "es", "it", "fr", "de", "pt", "ca", "eu", "gl"],
+    ["en", "es", "it", "fr", "de", "pt", "nl", "ru", "ar"],
     default=["en", "es", "it"]
 )
 extra_sw = st.sidebar.text_area(
