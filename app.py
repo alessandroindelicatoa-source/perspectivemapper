@@ -1,762 +1,1016 @@
-"""
-PerspectiveMapper - Advanced Discourse Analysis Tool
-Supports: TXT, DOCX, PDF, XLSX file formats
-Features: Topic modeling, sentiment analysis, bias detection, similarity analysis
-"""
+from __future__ import annotations
 
-import os
-import re
+import io
 import json
-import warnings
+import os
+import sys
+import zipfile
+import html as html_lib
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
-from io import BytesIO
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-# Configure page FIRST
-st.set_page_config(
-    page_title="PerspectiveMapper",
-    page_icon="🧭",
-    layout="wide",
-    initial_sidebar_state="expanded"
+from analysis_core import (
+    DEFAULT_FRAMES, EMBEDDING_MODEL, SENTIMENT_MODEL,
+    aggregate_embeddings, build_chunks, clean_for_lexical, collocations_pmi,
+    document_statistics, excel_bytes, frame_indicators, hierarchy_from_embeddings,
+    informative_log_odds, json_safe, kwic, numeric_group_test, safe_language,
+    semantic_clustering, tokenize, top_tfidf_terms, topic_models,
+    aggregate_entities, actor_topic_edges, bootstrap_difference_ci, bootstrap_mean_ci,
+    robust_time_trend, supervised_embedding_classifier, temporal_bootstrap_summary,
 )
+from i18n import UI_LANGUAGES, tr
 
-# NLP / ML
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
-from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
-from sklearn.decomposition import LatentDirichletAllocation
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import StandardScaler
+st.set_page_config(page_title="PerspectiveMapper v3.1", page_icon="🧭", layout="wide", initial_sidebar_state="expanded")
 
-# Tokenization & Stopwords - Using NLTK for Python 3.13+ compatibility
-import nltk
-from nltk.corpus import stopwords as nltk_stopwords
-from langdetect import detect, DetectorFactory
-DetectorFactory.seed = 0
-
-# Download NLTK stopwords data on first run
-try:
-    nltk_stopwords.words('english')
-except LookupError:
-    nltk.download('stopwords', quiet=True)
-
-# WordCloud & Viz
-from wordcloud import WordCloud
-import matplotlib.pyplot as plt
-import plotly.express as px
-import plotly.figure_factory as ff
-import plotly.graph_objects as go
-
-# File handling
-from docx import Document as DocxDocument
-import openpyxl
-
-# Sentence embeddings
-warnings.filterwarnings("ignore", category=FutureWarning)
-from sentence_transformers import SentenceTransformer
-
-# Sentiment analysis
-cardiff_error = None
-try:
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    import torch
-    CARDIFF_MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment"
-    _cardiff_tokenizer = AutoTokenizer.from_pretrained(CARDIFF_MODEL_NAME)
-    _cardiff_model = AutoModelForSequenceClassification.from_pretrained(CARDIFF_MODEL_NAME)
-    _use_cardiff = True
-except Exception as e:
-    cardiff_error = str(e)
-    _use_cardiff = False
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    _vader_analyzer = SentimentIntensityAnalyzer()
-
-# PDF support
-try:
-    import pdfplumber
-    _pdf_available = True
-except ImportError:
-    _pdf_available = False
+ROOT = Path(__file__).parent
+NER_MODEL = "Davlan/xlm-roberta-base-ner-hrl"
 
 
-# ========================================
-# PASSWORD GATE
-# ========================================
-def gate():
-    """Simple username/password gate using st.secrets['passwords']"""
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    if st.session_state.authenticated:
-        return True
-
-    st.title("🔐 PerspectiveMapper – Access")
-    st.write("Enter your username and password.")
-    user = st.text_input("Username", key="auth_user")
-    pwd = st.text_input("Password", type="password", key="auth_pwd")
-
-    if st.button("Log in"):
-        try:
-            if "passwords" in st.secrets and user in st.secrets["passwords"]:
-                if str(st.secrets["passwords"][user]) == str(pwd):
-                    st.session_state.authenticated = True
-                    st.success("Access granted ✅")
-                    st.rerun()
-                else:
-                    st.error("Incorrect password.")
-            else:
-                st.error("User not found in [passwords].")
-        except Exception as e:
-            st.error(f"Could not validate access: {e}")
-    st.stop()
+# ---------- Styling ----------
+st.markdown("""
+<style>
+.block-container {padding-top: 1.35rem; padding-bottom: 3rem; max-width: 1500px;}
+[data-testid="stMetricValue"] {font-size: 1.7rem;}
+.pm-note {padding: .75rem 1rem; border: 1px solid rgba(128,128,128,.25); border-radius: .6rem; margin: .5rem 0 1rem 0;}
+.small-muted {opacity:.72; font-size:.9rem;}
+</style>
+""", unsafe_allow_html=True)
 
 
-# ========================================
-# UTILITIES
-# ========================================
-@st.cache_resource(show_spinner=False)
-def get_embedder(model_name: str = "paraphrase-multilingual-MiniLM-L12-v2"):
-    """Load sentence transformer model with caching"""
-    return SentenceTransformer(model_name)
-
-
-def guess_lang(text: str) -> str:
-    """Detect language from text"""
+def optional_gate(lang: str) -> None:
+    """Authenticate only when [passwords] exists in Streamlit secrets."""
     try:
-        return detect(text[:500]) if text else "en"
+        configured = "passwords" in st.secrets and len(st.secrets["passwords"]) > 0
     except Exception:
-        return "en"
-
-
-def collect_stopwords(selected_langs: List[str], extra_stop: List[str]) -> set:
-    """Collect stopwords from multiple languages using NLTK"""
-    sw = set()
-    # Map language codes to NLTK language names
-    lang_map = {
-        'en': 'english',
-        'es': 'spanish',
-        'it': 'italian',
-        'fr': 'french',
-        'de': 'german',
-        'pt': 'portuguese',
-        'nl': 'dutch',
-        'ru': 'russian',
-        'ar': 'arabic'
-    }
-    
-    for lang in selected_langs:
-        try:
-            nltk_lang = lang_map.get(lang, lang)
-            sw |= set(nltk_stopwords.words(nltk_lang))
-        except Exception:
-            # If language not available, skip it
-            pass
-    
-    sw |= set([w.strip().lower() for w in extra_stop if w.strip()])
-    sw |= set(["http", "https", "www", "com", "url", "link"])
-    return sw
-
-
-def simple_tokenize(text: str) -> List[str]:
-    """Tokenize text with URL removal"""
-    text = re.sub(r"http\S+|www\.\S+", " ", text, flags=re.I)
-    tokens = re.findall(r"[A-Za-zÀ-ÿ0-9_]+", text.lower(), flags=re.U)
-    return tokens
-
-
-def preprocess_docs(docs: List[Dict], stop_set: set) -> List[str]:
-    """Preprocess documents by removing stopwords and short tokens"""
-    cleaned = []
-    for d in docs:
-        toks = [t for t in simple_tokenize(d["text"]) if t not in stop_set and len(t) > 2]
-        cleaned.append(" ".join(toks))
-    return cleaned
-
-
-def read_txt_file(upload) -> str:
-    """Read text file"""
-    try:
-        return upload.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        st.warning(f"Error reading TXT file: {e}")
-        return ""
-
-
-def read_docx_file(upload) -> str:
-    """Read DOCX file"""
-    try:
-        doc = DocxDocument(upload)
-        return "\n".join([p.text for p in doc.paragraphs])
-    except Exception as e:
-        st.warning(f"Error reading DOCX file: {e}")
-        return ""
-
-
-def read_pdf_file(upload) -> str:
-    """Read PDF file using pdfplumber"""
-    if not _pdf_available:
-        st.warning("pdfplumber not installed. Cannot read PDF files.")
-        return ""
-    try:
-        with pdfplumber.open(upload) as pdf:
-            text = ""
-            for page in pdf.pages:
-                extracted = page.extract_text()
-                if extracted:
-                    text += extracted + "\n"
-            return text
-    except Exception as e:
-        st.warning(f"Error reading PDF file: {e}")
-        return ""
-
-
-def read_excel_file(upload) -> str:
-    """Read Excel file and extract text from all cells"""
-    try:
-        workbook = openpyxl.load_workbook(upload)
-        text = ""
-        for sheet in workbook.sheetnames:
-            ws = workbook[sheet]
-            text += f"\n[Sheet: {sheet}]\n"
-            for row in ws.iter_rows(values_only=True):
-                for cell in row:
-                    if cell is not None:
-                        text += str(cell) + " "
-        return text
-    except Exception as e:
-        st.warning(f"Error reading Excel file: {e}")
-        return ""
-
-
-def read_file(upload) -> str:
-    """Read file based on extension"""
-    name = upload.name.lower()
-    if name.endswith(".txt"):
-        return read_txt_file(upload)
-    elif name.endswith(".docx"):
-        return read_docx_file(upload)
-    elif name.endswith(".pdf"):
-        return read_pdf_file(upload)
-    elif name.endswith((".xlsx", ".xls")):
-        return read_excel_file(upload)
-    else:
-        st.warning(f"Unsupported file type: {name}")
-        return ""
-
-
-def make_wordcloud(text: str, title: str = ""):
-    """Generate and display wordcloud"""
-    if not text.strip():
-        st.caption("Empty text - cannot generate wordcloud")
+        configured = False
+    if not configured:
         return
-    try:
-        wc = WordCloud(width=1000, height=600, background_color="white").generate(text)
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.imshow(wc, interpolation="bilinear")
-        ax.axis("off")
-        if title:
-            fig.suptitle(title, fontsize=14, fontweight="bold")
-        st.pyplot(fig, clear_figure=True)
-    except Exception as e:
-        st.warning(f"Error generating wordcloud: {e}")
-
-
-def top_words_per_topic(lda, feature_names, n_top: int = 10) -> pd.DataFrame:
-    """Extract top words for each LDA topic"""
-    topics = []
-    for topic_idx, topic in enumerate(lda.components_):
-        top_indices = topic.argsort()[-n_top:][::-1]
-        words = [feature_names[i] for i in top_indices]
-        scores = [topic[i] for i in top_indices]
-        topics.append({
-            "topic": topic_idx,
-            "top_words": ", ".join(words),
-            "avg_score": float(np.mean(scores))
-        })
-    return pd.DataFrame(topics)
-
-
-def run_cardiff_sentiment(texts: List[str]) -> Tuple[List[str], List[float]]:
-    """Run CardiffNLP sentiment analysis"""
-    labels, scores = [], []
-    if not _use_cardiff:
-        return labels, scores
-    id2label = {0: "negative", 1: "neutral", 2: "positive"}
-    for t in texts:
+    if st.session_state.get("authenticated"):
+        return
+    st.title(f"🔐 PerspectiveMapper — {tr(lang, 'access')}")
+    u = st.text_input(tr(lang, "username"))
+    p = st.text_input(tr(lang, "password"), type="password")
+    if st.button(tr(lang, "login"), type="primary"):
         try:
-            inputs = _cardiff_tokenizer(t, return_tensors="pt", truncation=True, max_length=256)
-            with torch.no_grad():
-                outputs = _cardiff_model(**inputs)
-                probs = torch.nn.functional.softmax(outputs.logits, dim=-1).cpu().numpy()[0]
-            idx = int(np.argmax(probs))
-            labels.append(id2label[idx])
-            scores.append(float(probs[idx]))
-        except Exception:
-            labels.append("neutral")
-            scores.append(0.0)
-    return labels, scores
-
-
-def run_vader_sentiment(texts: List[str]) -> Tuple[List[str], List[float]]:
-    """Run VADER sentiment analysis"""
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    an = SentimentIntensityAnalyzer()
-    labels, scores = [], []
-    for t in texts:
-        res = an.polarity_scores(t)
-        comp = res["compound"]
-        if comp >= 0.05:
-            labels.append("positive")
-        elif comp <= -0.05:
-            labels.append("negative")
-        else:
-            labels.append("neutral")
-        scores.append(float(comp))
-    return labels, scores
-
-
-def build_bias_table(texts: List[str], bias_dict: Dict[str, List[str]]) -> pd.DataFrame:
-    """Analyze bias indicators in texts"""
-    rows = []
-    lowered = [t.lower() for t in texts]
-    for i, t in enumerate(lowered):
-        row = {"doc_id": i}
-        total = max(len(t.split()), 1)
-        for label, kws in bias_dict.items():
-            hits = 0
-            for kw in kws:
-                kw = kw.lower().strip()
-                if not kw:
-                    continue
-                hits += len(re.findall(rf"\b{re.escape(kw)}\b", t))
-            row[label] = hits / total
-        rows.append(row)
-    return pd.DataFrame(rows)
-
-
-def calculate_document_statistics(docs: List[Dict], cleaned: List[str]) -> pd.DataFrame:
-    """Calculate detailed statistics for each document"""
-    stats = []
-    for i, (doc, clean_text) in enumerate(zip(docs, cleaned)):
-        raw_text = doc["text"]
-        stats.append({
-            "document": doc["filename"],
-            "language": doc["lang"],
-            "raw_chars": len(raw_text),
-            "raw_words": len(raw_text.split()),
-            "cleaned_words": len(clean_text.split()),
-            "unique_words": len(set(clean_text.split())),
-            "avg_word_length": np.mean([len(w) for w in clean_text.split()]) if clean_text.split() else 0,
-            "sentences": len(re.split(r'[.!?]+', raw_text)),
-        })
-    return pd.DataFrame(stats)
-
-
-def calculate_tfidf_analysis(cleaned: List[str], feature_names: List[str]) -> pd.DataFrame:
-    """Calculate TF-IDF scores for top terms"""
-    try:
-        vectorizer = TfidfVectorizer(max_features=50)
-        tfidf_matrix = vectorizer.fit_transform(cleaned)
-        feature_names_tfidf = vectorizer.get_feature_names_out()
-        
-        # Get top terms by average TF-IDF score
-        avg_tfidf = np.asarray(tfidf_matrix.mean(axis=0)).flatten()
-        top_indices = avg_tfidf.argsort()[-20:][::-1]
-        
-        results = []
-        for idx in top_indices:
-            results.append({
-                "term": feature_names_tfidf[idx],
-                "avg_tfidf": float(avg_tfidf[idx])
-            })
-        return pd.DataFrame(results)
-    except Exception as e:
-        st.warning(f"Error calculating TF-IDF: {e}")
-        return pd.DataFrame()
-
-
-# ========================================
-# MAIN APP
-# ========================================
-gate()  # Require password
-
-# Header
-c1, c2 = st.columns([1, 4])
-with c1:
-    logo_candidates = [
-        Path(__file__).parent / "assets" / "logo.png",
-        Path.cwd() / "assets" / "logo.png",
-        "assets/logo.png",
-    ]
-    logo_path = None
-    for p in logo_candidates:
-        try:
-            if isinstance(p, str):
-                if os.path.exists(p):
-                    logo_path = p
-                    break
+            if u in st.secrets["passwords"] and str(st.secrets["passwords"][u]) == str(p):
+                st.session_state.authenticated = True
+                st.rerun()
             else:
-                if p.exists():
-                    logo_path = str(p)
-                    break
+                st.error(tr(lang, "bad_login"))
         except Exception:
-            pass
-    if logo_path:
-        st.image(logo_path, use_container_width=True)
-
-with c2:
-    st.title("PerspectiveMapper")
-    st.write("Advanced discourse analysis: topics, sentiment, similarity, and bias detection.")
-
-# Sidebar Configuration
-st.sidebar.header("⚙️ Settings")
-
-# File upload with enhanced format support
-file_types = ["txt", "docx", "pdf", "xlsx", "xls"]
-uploads = st.sidebar.file_uploader(
-    "Upload files (.txt, .docx, .pdf, .xlsx)",
-    type=file_types,
-    accept_multiple_files=True
-)
-
-# Analysis settings
-st.sidebar.subheader("Analysis Options")
-lang_codes = st.sidebar.multiselect(
-    "Stopword languages",
-    ["en", "es", "it", "fr", "de", "pt", "nl", "ru", "ar"],
-    default=["en", "es", "it"]
-)
-extra_sw = st.sidebar.text_area(
-    "Extra stopwords (comma-separated)",
-    value="and, the, of, to, a, in, is, it"
-)
-
-# Visualization options
-st.sidebar.subheader("Visualization Options")
-show_wc = st.sidebar.checkbox("Show WordCloud per document", value=True)
-show_stats = st.sidebar.checkbox("Show document statistics", value=True)
-show_tfidf = st.sidebar.checkbox("Show TF-IDF analysis", value=True)
-
-# Analysis parameters
-st.sidebar.subheader("Model Parameters")
-n_topics = st.sidebar.slider("LDA topics", 2, 12, 5)
-max_features = st.sidebar.slider("Max vocabulary size", 1000, 10000, 3000, step=500)
-n_clusters = st.sidebar.slider("KMeans clusters", 2, 12, 4)
-
-# Sentiment analysis
-st.sidebar.subheader("Sentiment Analysis")
-use_cardiff = st.sidebar.checkbox("Use CardiffNLP sentiment", value=True)
-
-# Bias detection
-st.sidebar.subheader("Bias Detection")
-bias_json = st.sidebar.text_area(
-    "Bias dictionary JSON",
-    value=json.dumps({
-        "gender": ["woman", "man", "trans", "equality", "female", "male"],
-        "migration": ["immigrant", "migrant", "refugee", "border", "asylum"],
-        "religion": ["church", "islam", "catholic", "jewish", "christian"],
-        "politics": ["left", "right", "liberal", "conservative", "democrat", "republican"]
-    }, indent=2)
-)
-
-# Export options
-st.sidebar.subheader("Export Options")
-want_csv = st.sidebar.checkbox("Enable CSV download", value=True)
-want_json = st.sidebar.checkbox("Enable JSON download", value=True)
-
-# Main Content
-if not uploads:
-    st.info("⬅️ Upload one or more files to begin the analysis.")
+            st.error(tr(lang, "bad_login"))
     st.stop()
 
-# Load documents
-docs = []
-for up in uploads:
-    text = read_file(up)
-    if text.strip():
-        lang = guess_lang(text)
-        docs.append({"filename": up.name, "text": text, "lang": lang})
-    else:
-        st.warning(f"⚠️ {up.name} is empty or could not be read.")
 
-if not docs:
-    st.error("No valid documents loaded. Please check your files.")
-    st.stop()
+@st.cache_resource(show_spinner=False)
+def get_embedder():
+    from sentence_transformers import SentenceTransformer
+    return SentenceTransformer(EMBEDDING_MODEL)
 
-st.success(f"✅ Loaded {len(docs)} document(s).")
 
-# Preprocessing
-stop_set = collect_stopwords(lang_codes, [w.strip() for w in extra_sw.split(",")])
-cleaned = preprocess_docs(docs, stop_set)
+@st.cache_resource(show_spinner=False)
+def get_sentiment_pipeline():
+    from transformers import pipeline
+    return pipeline("text-classification", model=SENTIMENT_MODEL, tokenizer=SENTIMENT_MODEL, top_k=None, device=-1)
 
-# ========================================
-# DOCUMENT STATISTICS
-# ========================================
-if show_stats:
-    st.subheader("📊 Document Statistics")
-    stats_df = calculate_document_statistics(docs, cleaned)
-    st.dataframe(stats_df, use_container_width=True)
 
-# ========================================
-# WORDCLOUDS
-# ========================================
-if show_wc:
-    st.subheader("☁️ WordCloud per document")
-    for d, text in zip(docs, cleaned):
-        st.markdown(f"**{d['filename']}**")
-        make_wordcloud(text, title=d['filename'])
+@st.cache_resource(show_spinner=False)
+def get_ner_pipeline():
+    from transformers import pipeline
+    return pipeline("token-classification", model=NER_MODEL, tokenizer=NER_MODEL, aggregation_strategy="simple", device=-1)
 
-# ========================================
-# TF-IDF ANALYSIS
-# ========================================
-if show_tfidf:
-    st.subheader("🔤 TF-IDF Analysis (Top Terms)")
-    tfidf_df = calculate_tfidf_analysis(cleaned, [])
-    if not tfidf_df.empty:
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            fig = px.bar(
-                tfidf_df,
-                x="avg_tfidf",
-                y="term",
-                orientation="h",
-                title="Top 20 Terms by TF-IDF Score",
-                labels={"avg_tfidf": "Average TF-IDF Score", "term": "Term"}
+
+def parse_sentiment_output(raw) -> Dict[str, float]:
+    """Normalize transformers pipeline output across top_k/return_all_scores versions."""
+    if isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], list):
+        raw = raw[0]
+    if isinstance(raw, dict):
+        raw = [raw]
+    probs = {"positive": np.nan, "neutral": np.nan, "negative": np.nan}
+    for item in raw or []:
+        label = str(item.get("label", "")).lower()
+        score = float(item.get("score", np.nan))
+        if "pos" in label or label == "label_0": probs["positive"] = score
+        elif "neu" in label or label == "label_1": probs["neutral"] = score
+        elif "neg" in label or label == "label_2": probs["negative"] = score
+    return probs
+
+
+def sentiment_chunks(chunks: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    pipe = get_sentiment_pipeline()
+    texts = chunks["chunk_text"].astype(str).tolist()
+    rows = []
+    batch = 16
+    for start in range(0, len(texts), batch):
+        outs = pipe(texts[start:start+batch], truncation=True, max_length=384, batch_size=batch)
+        for j, raw in enumerate(outs):
+            probs = parse_sentiment_output(raw)
+            score = probs["positive"] - probs["negative"] if np.isfinite(probs["positive"]) and np.isfinite(probs["negative"]) else np.nan
+            label = max(probs, key=lambda k: probs[k] if np.isfinite(probs[k]) else -1)
+            rows.append({
+                "chunk_id": chunks.iloc[start+j]["chunk_id"],
+                "doc_id": chunks.iloc[start+j]["doc_id"],
+                "sentiment": label,
+                "sentiment_score": score,
+                "p_positive": probs["positive"],
+                "p_neutral": probs["neutral"],
+                "p_negative": probs["negative"],
+            })
+    cdf = pd.DataFrame(rows)
+    agg = cdf.groupby("doc_id", as_index=False).agg(
+        sentiment_score=("sentiment_score", "mean"),
+        p_positive=("p_positive", "mean"),
+        p_neutral=("p_neutral", "mean"),
+        p_negative=("p_negative", "mean"),
+        sentiment_sd=("sentiment_score", "std"),
+        sentiment_chunks=("chunk_id", "count"),
+    )
+    agg["sentiment"] = agg[["p_positive","p_neutral","p_negative"]].idxmax(axis=1).str.replace("p_", "", regex=False)
+    return cdf, agg
+
+
+
+def entity_documents(docs: pd.DataFrame, max_words: int = 180) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Optional multilingual NER on non-overlapping chunks to avoid overlap double-counting."""
+    pipe = get_ner_pipeline()
+    rows = []
+    for r in docs.itertuples():
+        # Reuse chunker via a small temporary document set, but force zero overlap for NER.
+        tmp = build_chunks(pd.DataFrame([{"doc_id": str(r.doc_id), "text": str(r.text), "language": str(r.language)}]), max_words, 0)
+        for c in tmp.itertuples():
+            try:
+                out = pipe(str(c.chunk_text), truncation=True, max_length=384)
+            except TypeError:
+                out = pipe(str(c.chunk_text))
+            for item in out or []:
+                surface = str(item.get("word", "")).replace("▁", " ").strip()
+                etype = str(item.get("entity_group", item.get("entity", ""))).replace("B-", "").replace("I-", "")
+                score = float(item.get("score", np.nan))
+                if surface and etype and (not np.isfinite(score) or score >= 0.45):
+                    rows.append({"doc_id": str(r.doc_id), "chunk_id": str(c.chunk_id), "entity": surface,
+                                 "entity_type": etype, "score": score})
+    mentions = pd.DataFrame(rows)
+    return mentions, aggregate_entities(mentions)
+
+
+def build_analysis_dataset(R: Dict[str, object]) -> pd.DataFrame:
+    df = R["docs"].copy()
+    if "frames" in R:
+        df = df.merge(R["frames"], on="doc_id", how="left")
+    if "doc_stats" in R:
+        df = df.merge(R["doc_stats"].drop(columns=["source_file","language"], errors="ignore"), on="doc_id", how="left")
+    tm = R.get("topics", {})
+    for key in ["lda_doc_topic", "nmf_doc_topic"]:
+        tdf = tm.get(key) if isinstance(tm, dict) else None
+        if isinstance(tdf, pd.DataFrame) and len(tdf) == len(df):
+            df = pd.concat([df.reset_index(drop=True), tdf.reset_index(drop=True)], axis=1)
+    return df
+
+
+def actor_topic_network_figure(edges: pd.DataFrame):
+    import networkx as nx
+    if edges is None or edges.empty:
+        return None
+    G = nx.Graph()
+    for r in edges.itertuples():
+        a = f"A::{r.entity}"
+        t = f"T::{r.topic}"
+        G.add_node(a, label=str(r.entity), kind="actor", entity_type=str(r.entity_type))
+        G.add_node(t, label=str(r.topic), kind="topic", entity_type="topic")
+        G.add_edge(a, t, weight=float(r.weight))
+    pos = nx.spring_layout(G, seed=42, weight="weight", k=max(0.35, 1.8 / max(len(G), 2) ** 0.5))
+    edge_x, edge_y = [], []
+    for u, v, d in G.edges(data=True):
+        x0, y0 = pos[u]; x1, y1 = pos[v]
+        edge_x += [x0, x1, None]; edge_y += [y0, y1, None]
+    edge_trace = go.Scatter(x=edge_x, y=edge_y, mode="lines", hoverinfo="none", line=dict(width=0.8))
+    actor_x=[]; actor_y=[]; actor_text=[]; actor_hover=[]; actor_size=[]
+    topic_x=[]; topic_y=[]; topic_text=[]; topic_hover=[]; topic_size=[]
+    deg = dict(G.degree(weight="weight"))
+    for n, d in G.nodes(data=True):
+        x, y = pos[n]
+        size = 10 + 4*np.sqrt(max(deg.get(n, 0), 0))
+        if d["kind"] == "actor":
+            actor_x.append(x); actor_y.append(y); actor_text.append(d["label"]); actor_hover.append(f"{d['label']} · {d['entity_type']}"); actor_size.append(size)
+        else:
+            topic_x.append(x); topic_y.append(y); topic_text.append(d["label"]); topic_hover.append(d["label"]); topic_size.append(size)
+    actor_trace = go.Scatter(x=actor_x, y=actor_y, mode="markers+text", text=actor_text, textposition="top center",
+                             hovertext=actor_hover, hoverinfo="text", marker=dict(size=actor_size), name="Actors/entities")
+    topic_trace = go.Scatter(x=topic_x, y=topic_y, mode="markers+text", text=topic_text, textposition="bottom center",
+                             hovertext=topic_hover, hoverinfo="text", marker=dict(size=topic_size, symbol="diamond"), name="Topics")
+    fig = go.Figure([edge_trace, actor_trace, topic_trace])
+    fig.update_layout(height=700, showlegend=True, xaxis=dict(visible=False), yaxis=dict(visible=False), margin=dict(l=10,r=10,t=40,b=10))
+    return fig
+
+
+def make_html_report(R: Dict[str, object], params: Dict[str, object], lang: str = "en") -> bytes:
+    master = R["master_docs"]
+    stats = R["doc_stats"]
+    meth = methodology_table(params, R)
+    kw = R.get("keywords", pd.DataFrame()).head(25)
+    frames = R.get("frames", pd.DataFrame())
+    frame_cols = [c for c in frames.columns if c.endswith("_per_1000")] if isinstance(frames, pd.DataFrame) else []
+    frame_summary = frames[frame_cols].mean().sort_values(ascending=False).rename("mean_per_1000").reset_index().rename(columns={"index":"frame"}) if frame_cols else pd.DataFrame()
+    def table(df):
+        return df.to_html(index=False, border=0, classes="pm-table", escape=True) if isinstance(df,pd.DataFrame) and not df.empty else "<p>Not available.</p>"
+    body = f"""<!doctype html><html><head><meta charset='utf-8'><title>PerspectiveMapper v3.1 report</title>
+    <style>body{{font-family:Arial,sans-serif;max-width:1100px;margin:40px auto;line-height:1.45;color:#222}}h1,h2{{margin-top:1.5em}}.metrics{{display:flex;gap:30px;flex-wrap:wrap}}.metric{{padding:12px 18px;border:1px solid #ddd;border-radius:8px}}table{{border-collapse:collapse;width:100%;font-size:14px}}th,td{{border-bottom:1px solid #ddd;padding:7px;text-align:left}}.note{{background:#f5f5f5;padding:12px;border-radius:6px}}</style>
+    </head><body><h1>PerspectiveMapper v3.1 — Research Report</h1>
+    <p class='note'>Generated from the analysed corpus. NLP outputs are measurements with model uncertainty and require substantive validation.</p>
+    <div class='metrics'><div class='metric'><b>Documents</b><br>{len(master)}</div><div class='metric'><b>Words</b><br>{int(stats['words'].sum())}</div><div class='metric'><b>Languages</b><br>{master['language'].nunique()}</div></div>
+    <h2>Methodology</h2>{table(meth)}<h2>Top TF-IDF terms</h2>{table(kw)}<h2>Mean framing indicators</h2>{table(frame_summary)}
+    <h2>Reproducibility note</h2><p>Document-level inference is appropriate only when documents are defensible independent analytical units. For nested or repeated data, use a corresponding multilevel/panel design.</p>
+    </body></html>"""
+    return body.encode("utf-8")
+
+
+def publication_package(R: Dict[str, object], params: Dict[str, object]) -> bytes:
+    """ZIP with 300-dpi PNG/SVG figures, CSV tables, HTML report and methodology."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    bio = io.BytesIO()
+    with zipfile.ZipFile(bio, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        master = R["master_docs"]
+        meth = methodology_table(params, R)
+        z.writestr("tables/documents.csv", master.drop(columns=["text"], errors="ignore").to_csv(index=False))
+        z.writestr("tables/document_statistics.csv", R["doc_stats"].to_csv(index=False))
+        z.writestr("tables/keywords_tfidf.csv", R.get("keywords", pd.DataFrame()).to_csv(index=False))
+        z.writestr("tables/frames.csv", R.get("frames", pd.DataFrame()).to_csv(index=False))
+        z.writestr("methodology.csv", meth.to_csv(index=False))
+        z.writestr("report.html", make_html_report(R, params))
+        if "entities" in R: z.writestr("tables/entities.csv", R["entities"].to_csv(index=False))
+        if "sentiment_docs" in R: z.writestr("tables/sentiment_documents.csv", R["sentiment_docs"].to_csv(index=False))
+        tm = R.get("topics", {})
+        for key in ["lda_topics","lda_doc_topic","nmf_topics","nmf_doc_topic"]:
+            if isinstance(tm.get(key), pd.DataFrame): z.writestr(f"tables/{key}.csv", tm[key].to_csv(index=False))
+        figures=[]
+        kw = R.get("keywords", pd.DataFrame()).head(20)
+        if isinstance(kw,pd.DataFrame) and not kw.empty:
+            fig, ax = plt.subplots(figsize=(8,6)); q=kw.sort_values("mean_tfidf"); ax.barh(q["term"], q["mean_tfidf"]); ax.set_xlabel("Mean TF-IDF"); ax.set_title("Top distinctive terms"); fig.tight_layout(); figures.append(("figure_01_tfidf",fig))
+        if "sentiment_docs" in R and not R["sentiment_docs"].empty:
+            sd=R["sentiment_docs"].sort_values("sentiment_score")
+            fig, ax = plt.subplots(figsize=(9,5)); ax.bar(sd["doc_id"].astype(str), sd["sentiment_score"]); ax.axhline(0,linewidth=.8); ax.set_ylabel("P(positive) − P(negative)"); ax.set_title("Document-level sentiment"); ax.tick_params(axis='x',rotation=90); fig.tight_layout(); figures.append(("figure_02_sentiment",fig))
+        frames=R.get("frames",pd.DataFrame()); fcols=[c for c in frames.columns if c.endswith("_per_1000")] if isinstance(frames,pd.DataFrame) else []
+        if fcols:
+            means=frames[fcols].mean().sort_values()
+            fig, ax = plt.subplots(figsize=(8,5)); ax.barh([x.replace("frame_","").replace("_per_1000","") for x in means.index],means.values); ax.set_xlabel("Mean hits per 1,000 tokens"); ax.set_title("Framing indicators"); fig.tight_layout(); figures.append(("figure_03_frames",fig))
+        tdf=tm.get("nmf_doc_topic") if isinstance(tm,dict) else None
+        if isinstance(tdf,pd.DataFrame) and not tdf.empty:
+            means=tdf.mean().sort_values()
+            fig, ax=plt.subplots(figsize=(8,5)); ax.barh(means.index,means.values); ax.set_xlabel("Mean topic weight"); ax.set_title("NMF topic prevalence"); fig.tight_layout(); figures.append(("figure_04_topics",fig))
+        for name,fig in figures:
+            png=io.BytesIO(); svg=io.BytesIO(); fig.savefig(png,format="png",dpi=300,bbox_inches="tight"); fig.savefig(svg,format="svg",bbox_inches="tight"); plt.close(fig)
+            z.writestr(f"figures/{name}.png",png.getvalue()); z.writestr(f"figures/{name}.svg",svg.getvalue())
+    return bio.getvalue()
+
+def read_unstructured(upload) -> str:
+    name = upload.name.lower()
+    data = upload.getvalue()
+    if name.endswith(".txt"):
+        return data.decode("utf-8", errors="ignore")
+    if name.endswith(".docx"):
+        from docx import Document
+        doc = Document(io.BytesIO(data))
+        blocks = [p.text for p in doc.paragraphs if p.text.strip()]
+        for table in doc.tables:
+            for row in table.rows:
+                vals = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if vals: blocks.append(" | ".join(vals))
+        return "\n".join(blocks)
+    if name.endswith(".pdf"):
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            return "\n".join(filter(None, (page.extract_text() for page in pdf.pages)))
+    return ""
+
+
+def read_table(upload, sheet: Optional[str] = None) -> pd.DataFrame:
+    data = io.BytesIO(upload.getvalue())
+    if upload.name.lower().endswith(".csv"):
+        # Try UTF-8 and let pandas infer delimiter; fall back to latin-1.
+        try:
+            return pd.read_csv(data, sep=None, engine="python")
+        except UnicodeDecodeError:
+            data.seek(0)
+            return pd.read_csv(data, sep=None, engine="python", encoding="latin-1")
+    return pd.read_excel(data, sheet_name=sheet or 0)
+
+
+def excel_sheets(upload) -> List[str]:
+    if not upload.name.lower().endswith((".xlsx", ".xls")):
+        return []
+    try:
+        return pd.ExcelFile(io.BytesIO(upload.getvalue())).sheet_names
+    except Exception:
+        return []
+
+
+def candidate_text_column(df: pd.DataFrame) -> str:
+    candidates = [c for c in df.columns if df[c].dtype == "object" or pd.api.types.is_string_dtype(df[c])]
+    if not candidates:
+        return str(df.columns[0])
+    scores = {}
+    for c in candidates:
+        vals = df[c].dropna().astype(str).head(500)
+        scores[c] = vals.str.len().mean() if len(vals) else 0
+    return max(scores, key=scores.get)
+
+
+def prepare_corpus(uploads, configs) -> pd.DataFrame:
+    rows = []
+    used_ids = set()
+    for up in uploads:
+        lower = up.name.lower()
+        cfg = configs.get(up.name, {})
+        if lower.endswith((".csv", ".xlsx", ".xls")):
+            df = read_table(up, cfg.get("sheet"))
+            text_col = cfg["text_col"]
+            id_col = cfg.get("id_col")
+            meta_cols = cfg.get("meta_cols", [])
+            for ridx, row in df.iterrows():
+                text = "" if pd.isna(row[text_col]) else str(row[text_col]).strip()
+                if not text:
+                    continue
+                base_id = str(row[id_col]) if id_col and not pd.isna(row[id_col]) else f"{Path(up.name).stem}_{ridx+1}"
+                doc_id = base_id
+                n = 2
+                while doc_id in used_ids:
+                    doc_id = f"{base_id}_{n}"; n += 1
+                used_ids.add(doc_id)
+                rec = {"doc_id": doc_id, "source_file": up.name, "text": text}
+                for c in meta_cols:
+                    rec[str(c)] = row[c] if c in row.index else np.nan
+                rows.append(rec)
+        else:
+            text = read_unstructured(up).strip()
+            if not text:
+                continue
+            base_id = Path(up.name).stem
+            doc_id = base_id; n = 2
+            while doc_id in used_ids:
+                doc_id = f"{base_id}_{n}"; n += 1
+            used_ids.add(doc_id)
+            rows.append({"doc_id": doc_id, "source_file": up.name, "text": text})
+    docs = pd.DataFrame(rows)
+    if docs.empty:
+        return docs
+    docs["language"] = docs["text"].map(safe_language)
+    return docs
+
+
+def run_pipeline(docs: pd.DataFrame, chunk_words: int, overlap_words: int, n_topics: int,
+                 max_features: int, do_semantic: bool, do_sentiment: bool, do_entities: bool,
+                 auto_k: bool, k_manual: int, random_state: int) -> Dict[str, object]:
+    res: Dict[str, object] = {"docs": docs.copy()}
+    chunks = build_chunks(docs, chunk_words, overlap_words)
+    res["chunks"] = chunks
+    stats_df = document_statistics(docs)
+    res["doc_stats"] = stats_df
+    cleaned = [clean_for_lexical(r.text, r.language) for r in docs.itertuples()]
+    res["cleaned_docs"] = cleaned
+    res["keywords"] = top_tfidf_terms(cleaned, 40, max_features)
+    res["collocations"] = collocations_pmi(cleaned, min_count=max(2, int(np.ceil(len(docs)/8))), top_n=50)
+    res["topics"] = topic_models(cleaned, n_topics, max_features, random_state)
+    res["frames"] = frame_indicators(docs, DEFAULT_FRAMES)
+
+    if do_semantic and len(chunks):
+        try:
+            embedder = get_embedder()
+            chunk_emb = embedder.encode(
+                chunks["chunk_text"].astype(str).tolist(), batch_size=32,
+                show_progress_bar=False, normalize_embeddings=True,
             )
-            st.plotly_chart(fig, use_container_width=True)
-        with col2:
-            st.dataframe(tfidf_df, use_container_width=True)
+            doc_emb = aggregate_embeddings(chunk_emb, chunks, docs["doc_id"].astype(str).tolist())
+            sem_units = chunk_emb if len(chunks) >= 4 else doc_emb
+            sem = semantic_clustering(sem_units, auto_k, k_manual, random_state)
+            res["chunk_embeddings"] = chunk_emb
+            res["doc_embeddings"] = doc_emb
+            res["semantic"] = sem
+            res["semantic_unit"] = "chunk" if len(chunks) >= 4 else "document"
+            res["doc_similarity"] = pd.DataFrame(
+                np.clip(doc_emb @ doc_emb.T, -1, 1), index=docs["doc_id"], columns=docs["doc_id"]
+            )
+            res["hierarchy"] = hierarchy_from_embeddings(doc_emb)
+        except Exception as e:
+            res["semantic_error"] = str(e)
 
-# ========================================
-# TOPIC MODELING (LDA)
-# ========================================
-st.subheader("🧵 Topic Modeling (LDA)")
-try:
-    vectorizer = CountVectorizer(max_features=max_features)
-    X = vectorizer.fit_transform(cleaned)
-    lda = LatentDirichletAllocation(n_components=n_topics, random_state=42, max_iter=20)
-    W = lda.fit_transform(X)
-    topics_df = top_words_per_topic(lda, vectorizer.get_feature_names_out(), n_top=12)
-    st.dataframe(topics_df, use_container_width=True)
-    dominant_topic = np.argmax(W, axis=1).tolist()
-except Exception as e:
-    st.error(f"Error in LDA: {e}")
+    if do_sentiment and len(chunks):
+        try:
+            sc, sd = sentiment_chunks(chunks)
+            res["sentiment_chunks"] = sc
+            res["sentiment_docs"] = sd
+            res["docs"] = res["docs"].merge(sd, on="doc_id", how="left")
+        except Exception as e:
+            res["sentiment_error"] = str(e)
+
+    if do_entities:
+        try:
+            mentions, entities = entity_documents(docs)
+            res["entity_mentions"] = mentions
+            res["entities"] = entities
+        except Exception as e:
+            res["entities_error"] = str(e)
+
+    # Add statistics and frames to master document table.
+    master = res["docs"].merge(stats_df.drop(columns=["source_file","language"], errors="ignore"), on="doc_id", how="left")
+    master = master.merge(res["frames"], on="doc_id", how="left")
+    res["master_docs"] = master
+    return res
+
+
+def methodology_table(params: Dict[str, object], results: Dict[str, object]) -> pd.DataFrame:
+    rows = [
+        ("PerspectiveMapper version", "3.1 Research Edition"),
+        ("Python", sys.version.split()[0]),
+        ("Embedding model", EMBEDDING_MODEL if params.get("semantic") else "disabled"),
+        ("Sentiment model", SENTIMENT_MODEL if params.get("sentiment") else "disabled"),
+        ("Named-entity model", NER_MODEL if params.get("entities") else "disabled"),
+        ("Chunk size words", params.get("chunk_words")),
+        ("Chunk overlap words", params.get("overlap_words")),
+        ("Requested topics", params.get("n_topics")),
+        ("Maximum lexical features", params.get("max_features")),
+        ("Random seed", params.get("random_state")),
+        ("Semantic cluster selection", "silhouette" if params.get("auto_k") else f"manual k={params.get('k_manual')}"),
+        ("Semantic clustering space", "full normalized embedding space; PCA only for 2D visualisation"),
+        ("Hierarchical clustering", "average linkage on cosine distances"),
+        ("Sentiment aggregation", "chunk probabilities aggregated to document level"),
+        ("Framing indicators", "dictionary hits per 1,000 tokens; descriptive, not automated bias classification"),
+        ("Supervised stance/framing", "multilingual document embeddings + class-balanced logistic regression; stratified cross-validation on user-coded labels"),
+        ("Bootstrap", "percentile bootstrap resampling at document level"),
+    ]
+    return pd.DataFrame(rows, columns=["parameter", "value"])
+
+
+# ---------- Sidebar: language before gate ----------
+with st.sidebar:
+    chosen_ui = st.selectbox("Language / Idioma / Lingua", list(UI_LANGUAGES.keys()), index=0)
+lang = UI_LANGUAGES[chosen_ui]
+optional_gate(lang)
+
+# ---------- Header ----------
+logo = ROOT / "assets" / "logo.png"
+c1, c2 = st.columns([1, 7])
+with c1:
+    if logo.exists(): st.image(str(logo), use_container_width=True)
+with c2:
+    st.title("PerspectiveMapper v3.1")
+    st.caption(tr(lang, "subtitle"))
+
+with st.sidebar:
+    st.header(f"⚙️ {tr(lang, 'settings')}")
+    uploads = st.file_uploader(
+        tr(lang, "upload"), type=["txt","docx","pdf","csv","xlsx","xls"],
+        accept_multiple_files=True, help=tr(lang, "upload_help")
+    )
+
+configs: Dict[str, dict] = {}
+if uploads:
+    tabular = [u for u in uploads if u.name.lower().endswith((".csv", ".xlsx", ".xls"))]
+    if tabular:
+        with st.sidebar.expander(tr(lang, "structured"), expanded=True):
+            for up in tabular:
+                st.markdown(f"**{up.name}**")
+                sheets = excel_sheets(up)
+                sheet = st.selectbox(tr(lang, "sheet"), sheets, key=f"sheet_{up.name}") if sheets else None
+                try:
+                    preview = read_table(up, sheet).head(50)
+                    cols = [str(c) for c in preview.columns]
+                    auto_col = candidate_text_column(preview)
+                    text_col = st.selectbox(tr(lang, "text_column"), cols, index=cols.index(str(auto_col)), key=f"text_{up.name}")
+                    id_options = ["—"] + cols
+                    id_col_raw = st.selectbox(tr(lang, "id_column"), id_options, key=f"id_{up.name}")
+                    meta_default = [c for c in cols if c != text_col and c != id_col_raw][:6]
+                    meta_cols = st.multiselect(tr(lang, "metadata"), [c for c in cols if c != text_col], default=meta_default, key=f"meta_{up.name}")
+                    configs[up.name] = {"sheet": sheet, "text_col": text_col, "id_col": None if id_col_raw == "—" else id_col_raw, "meta_cols": meta_cols}
+                except Exception as e:
+                    st.warning(f"{up.name}: {e}")
+
+with st.sidebar:
+    st.subheader(tr(lang, "analysis_settings"))
+    chunk_words = st.slider(tr(lang, "chunk_words"), 60, 300, 140, 10)
+    overlap_words = st.slider(tr(lang, "overlap_words"), 0, 60, 20, 5)
+    n_topics = st.slider(tr(lang, "topics"), 2, 12, 5)
+    max_features = st.slider(tr(lang, "max_features"), 500, 12000, 5000, 500)
+    do_semantic = st.checkbox(tr(lang, "semantic"), value=True)
+    do_sentiment = st.checkbox(tr(lang, "sentiment"), value=True)
+    do_entities = st.checkbox(tr(lang, "entities_option"), value=False, help=tr(lang, "entities_help"))
+    auto_k = st.checkbox(tr(lang, "auto_k"), value=True)
+    k_manual = st.slider(tr(lang, "clusters"), 2, 12, 4, disabled=auto_k)
+    random_state = st.number_input("Random seed", value=42, step=1)
+    run_clicked = st.button(f"▶️ {tr(lang, 'run')}", type="primary", use_container_width=True)
+
+if not uploads:
+    st.info(tr(lang, "need_files"))
     st.stop()
 
-# ========================================
-# CLUSTERING (PCA + KMeans)
-# ========================================
-st.subheader("🧭 Clustering (SBERT + PCA + KMeans)")
 try:
-    embedder = get_embedder()
-    embeddings = embedder.encode([d["text"] for d in docs], show_progress_bar=False)
-    n_docs = len(docs)
-    
-    if n_docs < 2:
-        coords = np.zeros((n_docs, 2))
+    docs_now = prepare_corpus(uploads, configs)
+except Exception as e:
+    st.error(f"{tr(lang, 'error')}: {e}")
+    st.stop()
+
+if docs_now.empty:
+    st.error("No readable text was found in the uploaded files.")
+    st.stop()
+
+st.caption(f"{tr(lang, 'loaded')}: **{len(docs_now)} {tr(lang, 'documents')}**")
+
+params = {
+    "chunk_words": int(chunk_words), "overlap_words": int(overlap_words),
+    "n_topics": int(n_topics), "max_features": int(max_features),
+    "semantic": bool(do_semantic), "sentiment": bool(do_sentiment), "entities": bool(do_entities),
+    "auto_k": bool(auto_k), "k_manual": int(k_manual), "random_state": int(random_state),
+}
+corpus_signature = (tuple((u.name, len(u.getvalue())) for u in uploads), tuple(sorted((k, str(v)) for k,v in params.items())), json.dumps(configs, default=str, sort_keys=True))
+
+if run_clicked:
+    for _k in ["pm_group_bootstrap","pm_temporal_summary","pm_temporal_trend","pm_network_edges","pm_supervised","pm_supervised_info","pm_model_coefficients","pm_model_info","pm_publication_package"]:
+        st.session_state.pop(_k, None)
+    with st.spinner("Analysing corpus…"):
+        st.session_state.pm_results = run_pipeline(docs_now, **{
+            "chunk_words": int(chunk_words), "overlap_words": int(overlap_words),
+            "n_topics": int(n_topics), "max_features": int(max_features),
+            "do_semantic": bool(do_semantic), "do_sentiment": bool(do_sentiment), "do_entities": bool(do_entities),
+            "auto_k": bool(auto_k), "k_manual": int(k_manual), "random_state": int(random_state),
+        })
+        st.session_state.pm_signature = corpus_signature
+        st.session_state.pm_params = params
+    st.success(tr(lang, "analysis_complete"))
+
+if "pm_results" not in st.session_state or st.session_state.get("pm_signature") != corpus_signature:
+    st.info(f"▶️ {tr(lang, 'run')}")
+    st.stop()
+
+R = st.session_state.pm_results
+master = R["master_docs"]
+chunks = R["chunks"]
+
+# ---------- Tabs ----------
+tab_over, tab_lex, tab_topics, tab_sem, tab_sent, tab_frames, tab_entities, tab_groups, tab_temporal, tab_supervised, tab_models, tab_publication, tab_export = st.tabs([
+    f"📊 {tr(lang,'overview')}", f"🔤 {tr(lang,'lexical')}", f"🧵 {tr(lang,'topics_tab')}",
+    f"🧭 {tr(lang,'semantic_tab')}", f"💬 {tr(lang,'sentiment_tab')}", f"🧷 {tr(lang,'frames')}",
+    f"👥 {tr(lang,'entities_tab')}", f"⚖️ {tr(lang,'groups')}", f"📈 {tr(lang,'temporal_tab')}",
+    f"🎯 {tr(lang,'supervised_tab')}", f"📐 {tr(lang,'models')}", f"📝 {tr(lang,'publication_tab')}", f"⬇️ {tr(lang,'export')}"
+])
+
+with tab_over:
+    st.subheader(tr(lang, "corpus_metrics"))
+    stats_df = R["doc_stats"]
+    m1,m2,m3,m4 = st.columns(4)
+    m1.metric(tr(lang,"n_docs"), f"{len(master):,}")
+    m2.metric(tr(lang,"n_words"), f"{int(stats_df['words'].sum()):,}")
+    m3.metric(tr(lang,"n_langs"), f"{master['language'].nunique()}")
+    m4.metric(tr(lang,"n_chunks"), f"{len(chunks):,}")
+    c1,c2 = st.columns([1,2])
+    with c1:
+        lang_counts = master["language"].value_counts().rename_axis("language").reset_index(name="documents")
+        st.plotly_chart(px.bar(lang_counts, x="language", y="documents", title=tr(lang,"language_distribution")), use_container_width=True)
+    with c2:
+        st.subheader(tr(lang,"doc_stats"))
+        st.dataframe(stats_df, use_container_width=True, hide_index=True)
+    with st.expander(tr(lang,"docs_table")):
+        display_cols = [c for c in master.columns if c != "text"]
+        st.dataframe(master[display_cols], use_container_width=True, hide_index=True)
+
+with tab_lex:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'lexical_note')}</div>", unsafe_allow_html=True)
+    c1,c2 = st.columns(2)
+    with c1:
+        st.subheader(tr(lang,"top_terms"))
+        kw = R["keywords"]
+        if not kw.empty:
+            st.plotly_chart(px.bar(kw.head(25).sort_values("mean_tfidf"), x="mean_tfidf", y="term", orientation="h"), use_container_width=True)
+            st.dataframe(kw, use_container_width=True, hide_index=True)
+        else: st.info(tr(lang,"not_enough"))
+    with c2:
+        st.subheader(tr(lang,"collocations"))
+        coll = R["collocations"]
+        if coll is not None and not coll.empty:
+            st.dataframe(coll, use_container_width=True, hide_index=True)
+        else: st.info(tr(lang,"not_enough"))
+
+with tab_topics:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'topic_note')}</div>", unsafe_allow_html=True)
+    tm = R.get("topics", {})
+    c1,c2 = st.columns(2)
+    with c1:
+        st.subheader(tr(lang,"lda"))
+        if "lda_topics" in tm:
+            st.metric(tr(lang,"perplexity"), f"{tm.get('lda_perplexity', np.nan):.2f}")
+            st.dataframe(tm["lda_topics"], use_container_width=True, hide_index=True)
+            lda_weights = tm.get("lda_doc_topic")
+            if isinstance(lda_weights, pd.DataFrame) and len(lda_weights) == len(master):
+                plot = pd.concat([master[["doc_id"]].reset_index(drop=True), lda_weights.reset_index(drop=True)], axis=1)
+                long = plot.melt(id_vars="doc_id", var_name="topic", value_name="weight")
+                st.plotly_chart(px.bar(long, x="doc_id", y="weight", color="topic", title="Document-topic mixture"), use_container_width=True)
+        else: st.info(tm.get("lda_error", tr(lang,"not_enough")))
+    with c2:
+        st.subheader(tr(lang,"nmf"))
+        if "nmf_topics" in tm:
+            st.metric("NMF reconstruction error", f"{tm.get('nmf_reconstruction_error', np.nan):.3f}")
+            st.dataframe(tm["nmf_topics"], use_container_width=True, hide_index=True)
+            nmf_weights = tm.get("nmf_doc_topic")
+            if isinstance(nmf_weights, pd.DataFrame) and len(nmf_weights) == len(master):
+                plot = pd.concat([master[["doc_id"]].reset_index(drop=True), nmf_weights.reset_index(drop=True)], axis=1)
+                long = plot.melt(id_vars="doc_id", var_name="topic", value_name="weight")
+                st.plotly_chart(px.bar(long, x="doc_id", y="weight", color="topic", title="Document-topic mixture"), use_container_width=True)
+        else: st.info(tm.get("nmf_error", tr(lang,"not_enough")))
+
+with tab_sem:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'semantic_note')}</div>", unsafe_allow_html=True)
+    if "semantic_error" in R:
+        st.warning(f"{tr(lang,'model_unavailable')} ({R['semantic_error']})")
+    elif "semantic" not in R:
+        st.info(tr(lang,"model_unavailable"))
     else:
-        n_comp = min(2, n_docs, embeddings.shape[1])
-        pca = PCA(n_components=n_comp, random_state=42)
-        coords_pca = pca.fit_transform(embeddings)
-        coords = coords_pca if coords_pca.shape[1] == 2 else np.hstack([coords_pca, np.zeros((n_docs, 1))])
-    
-    df_plot = pd.DataFrame({
-        "x": coords[:, 0],
-        "y": coords[:, 1],
-        "file": [d["filename"] for d in docs],
-        "topic": [f"T{t}" for t in dominant_topic]
-    })
-    
-    k_for_fit = min(max(1, n_clusters), n_docs)
-    clusters = np.zeros(n_docs, dtype=int) if k_for_fit < 2 else KMeans(
-        n_clusters=k_for_fit, random_state=42, n_init="auto"
-    ).fit_predict(coords)
-    df_plot["cluster"] = clusters
-    
-    fig = px.scatter(
-        df_plot,
-        x="x",
-        y="y",
-        text="file",
-        color="cluster",
-        title="Document Clustering (PCA Projection)",
-        labels={"x": "PC1", "y": "PC2"}
-    )
-    fig.update_traces(textposition="top center")
-    st.plotly_chart(fig, use_container_width=True)
-except Exception as e:
-    st.error(f"Error in clustering: {e}")
-    clusters = np.zeros(n_docs, dtype=int)
+        sem = R["semantic"]
+        k1,k2,k3 = st.columns(3)
+        k1.metric("k", sem.get("k", 1))
+        k2.metric(tr(lang,"silhouette"), "—" if not np.isfinite(sem.get("silhouette",np.nan)) else f"{sem['silhouette']:.3f}")
+        k3.metric(tr(lang,"davies"), "—" if not np.isfinite(sem.get("davies_bouldin",np.nan)) else f"{sem['davies_bouldin']:.3f}")
+        coords = sem["coords"]
+        if R.get("semantic_unit") == "chunk":
+            plot = chunks[["chunk_id","doc_id","language"]].copy()
+            plot["x"], plot["y"], plot["cluster"] = coords[:,0], coords[:,1], sem["labels"].astype(str)
+            hover = ["doc_id","language","chunk_id"]
+        else:
+            plot = master[["doc_id","language"]].copy()
+            plot["x"], plot["y"], plot["cluster"] = coords[:,0], coords[:,1], sem["labels"].astype(str)
+            hover = ["doc_id","language"]
+        st.plotly_chart(px.scatter(plot, x="x", y="y", color="cluster", hover_data=hover, title=tr(lang,"semantic_clusters")), use_container_width=True)
+        kd = sem.get("k_diagnostics")
+        if isinstance(kd,pd.DataFrame) and not kd.empty:
+            st.plotly_chart(px.line(kd, x="k", y="silhouette", markers=True, title="k diagnostics"), use_container_width=True)
+        if "doc_similarity" in R and len(master) >= 2:
+            st.subheader(tr(lang,"similarity"))
+            sim = R["doc_similarity"]
+            fig = go.Figure(data=go.Heatmap(z=sim.values, x=sim.columns, y=sim.index, zmin=-1, zmax=1, colorscale="RdBu", reversescale=True))
+            fig.update_layout(height=max(450, min(900, 28*len(sim))))
+            st.plotly_chart(fig, use_container_width=True)
+            if R.get("hierarchy") is not None:
+                try:
+                    from scipy.cluster.hierarchy import dendrogram
+                    d = dendrogram(R["hierarchy"], labels=master["doc_id"].astype(str).tolist(), no_plot=True)
+                    xvals, yvals = [], []
+                    for xs, ys in zip(d["icoord"], d["dcoord"]):
+                        xvals.extend(xs + [None]); yvals.extend(ys + [None])
+                    figd = go.Figure(go.Scatter(x=xvals, y=yvals, mode="lines", hoverinfo="skip"))
+                    figd.update_layout(title="Hierarchical clustering · average linkage / cosine distance", xaxis=dict(tickmode="array", tickvals=[5+10*i for i in range(len(d["ivl"]))], ticktext=d["ivl"], tickangle=45), yaxis_title="Cosine distance", height=480)
+                    st.plotly_chart(figd, use_container_width=True)
+                except Exception:
+                    pass
+        st.subheader(tr(lang,"semantic_search"))
+        q = st.text_input(tr(lang,"query"), key="semantic_query")
+        if st.button(tr(lang,"search"), key="semantic_search_btn") and q.strip():
+            try:
+                emb = get_embedder().encode([q], normalize_embeddings=True)[0]
+                scores = np.asarray(R["chunk_embeddings"]) @ emb
+                ix = np.argsort(scores)[::-1][:10]
+                out = chunks.iloc[ix][["chunk_id","doc_id","chunk_text"]].copy()
+                out.insert(2, "similarity", scores[ix])
+                st.dataframe(out, use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.warning(str(e))
 
-# ========================================
-# HIERARCHICAL CLUSTERING DENDROGRAM
-# ========================================
-st.subheader("🌳 Hierarchical Clustering Dendrogram")
-try:
-    import scipy.cluster.hierarchy as sch
-    from scipy.spatial.distance import pdist
-    
-    dist_matrix = pdist(embeddings, metric="cosine")
-    linkage = sch.linkage(dist_matrix, method="ward")
-    
-    fig, ax = plt.subplots(figsize=(12, 6))
-    sch.dendrogram(
-        linkage,
-        labels=[d["filename"] for d in docs],
-        orientation="top",
-        leaf_rotation=45,
-        leaf_font_size=10,
-        ax=ax,
-    )
-    ax.set_title("Hierarchical Clustering of Documents")
-    ax.set_ylabel("Distance")
-    st.pyplot(fig)
-except Exception as e:
-    st.warning(f"Error generating dendrogram: {e}")
-
-# ========================================
-# SIMILARITY MATRIX
-# ========================================
-st.subheader("🔗 Document Similarity Matrix")
-try:
-    sim = cosine_similarity(embeddings)
-    heatmap = ff.create_annotated_heatmap(
-        z=sim,
-        x=[d["filename"] for d in docs],
-        y=[d["filename"] for d in docs],
-        showscale=True,
-        colorscale="Viridis"
-    )
-    heatmap.update_layout(title="Cosine Similarity Between Documents")
-    st.plotly_chart(heatmap, use_container_width=True)
-except Exception as e:
-    st.error(f"Error generating similarity matrix: {e}")
-
-# ========================================
-# SENTIMENT ANALYSIS
-# ========================================
-st.subheader("💬 Sentiment Analysis")
-try:
-    texts = [d["text"] for d in docs]
-    if use_cardiff and _use_cardiff:
-        labels, scores = run_cardiff_sentiment(texts)
+with tab_sent:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'sentiment_note')}</div>", unsafe_allow_html=True)
+    if "sentiment_error" in R:
+        st.warning(f"{tr(lang,'model_unavailable')} ({R['sentiment_error']})")
+    elif "sentiment_docs" not in R:
+        st.info(tr(lang,"model_unavailable"))
     else:
-        labels, scores = run_vader_sentiment(texts)
-    
-    sentiment_df = pd.DataFrame({
-        "document": [d["filename"] for d in docs],
-        "sentiment": labels,
-        "score": scores
-    })
-    
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        fig = px.bar(
-            sentiment_df,
-            x="document",
-            y="score",
-            color="sentiment",
-            title="Sentiment Scores by Document",
-            labels={"score": "Sentiment Score", "document": "Document"}
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        st.dataframe(sentiment_df, use_container_width=True)
-except Exception as e:
-    st.error(f"Error in sentiment analysis: {e}")
-    sentiment_df = pd.DataFrame()
+        sd = R["sentiment_docs"]
+        st.subheader(tr(lang,"sentiment_doc"))
+        st.dataframe(sd, use_container_width=True, hide_index=True)
+        st.plotly_chart(px.bar(sd, x="doc_id", y="sentiment_score", color="sentiment", range_y=[-1,1]), use_container_width=True)
+        st.subheader(tr(lang,"sentiment_chunks"))
+        sc = R["sentiment_chunks"].merge(chunks[["chunk_id","language"]], on="chunk_id", how="left")
+        st.plotly_chart(px.histogram(sc, x="sentiment_score", color="sentiment", nbins=30, marginal="box"), use_container_width=True)
 
-# ========================================
-# BIAS ANALYSIS
-# ========================================
-st.subheader("🧷 Bias Indicator Analysis")
-try:
-    bias_dict = json.loads(bias_json)
-except Exception as e:
-    st.error(f"Invalid JSON for bias keywords: {e}")
-    bias_dict = {}
+with tab_frames:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'frame_note')}</div>", unsafe_allow_html=True)
+    raw_default = json.dumps(DEFAULT_FRAMES, ensure_ascii=False, indent=2)
+    raw = st.text_area(tr(lang,"frame_dictionary"), value=raw_default, height=260)
+    try:
+        fdict = json.loads(raw)
+        fdf = frame_indicators(R["docs"], fdict)
+        rate_cols = [c for c in fdf.columns if c.endswith("_per_1000")]
+        st.dataframe(fdf, use_container_width=True, hide_index=True)
+        if rate_cols:
+            melt = fdf.melt(id_vars="doc_id", value_vars=rate_cols, var_name="frame", value_name="per_1000")
+            st.plotly_chart(px.bar(melt, x="doc_id", y="per_1000", color="frame", barmode="group"), use_container_width=True)
+    except Exception as e:
+        st.error(str(e))
+    st.subheader(tr(lang,"concordance"))
+    c1,c2 = st.columns([3,1])
+    with c1: term = st.text_input(tr(lang,"term"), key="kwic_term")
+    with c2: ctx = st.number_input(tr(lang,"context_words"), min_value=5, max_value=40, value=12)
+    if term.strip():
+        st.dataframe(kwic(R["docs"], term, int(ctx), 200), use_container_width=True, hide_index=True)
 
-bias_df = build_bias_table(texts, bias_dict) if bias_dict else pd.DataFrame()
 
-if not bias_df.empty:
-    st.dataframe(bias_df, use_container_width=True)
-    
-    # Visualization
-    fig = px.bar(
-        bias_df.melt(id_vars=["doc_id"], var_name="bias_category", value_name="score"),
-        x="doc_id",
-        y="score",
-        color="bias_category",
-        title="Bias Indicators by Document",
-        labels={"doc_id": "Document", "score": "Bias Score"}
-    )
-    st.plotly_chart(fig, use_container_width=True)
+with tab_entities:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'entities_note')}</div>", unsafe_allow_html=True)
+    if "entities_error" in R:
+        st.warning(f"{tr(lang,'model_unavailable')} ({R['entities_error']})")
+    elif "entities" not in R:
+        st.info(tr(lang,"entities_not_run"))
+    else:
+        entities = R["entities"]
+        if entities.empty:
+            st.info(tr(lang,"not_enough"))
+        else:
+            types = sorted(entities["entity_type"].dropna().astype(str).unique().tolist())
+            selected_types = st.multiselect(tr(lang,"entity_types"), types, default=[x for x in types if x in {"PER","ORG","LOC"}] or types)
+            ef = entities[entities["entity_type"].isin(selected_types)] if selected_types else entities.iloc[0:0]
+            totals = ef.groupby(["entity","entity_type"], as_index=False).agg(mentions=("mentions","sum"), documents=("doc_id","nunique"), mean_score=("mean_score","mean")).sort_values(["mentions","documents"], ascending=False)
+            c1,c2=st.columns([1,2])
+            with c1:
+                st.subheader(tr(lang,"top_entities")); st.dataframe(totals.head(50),use_container_width=True,hide_index=True)
+            with c2:
+                if not totals.empty:
+                    st.plotly_chart(px.bar(totals.head(25).sort_values("mentions"),x="mentions",y="entity",color="entity_type",orientation="h"),use_container_width=True)
+            st.subheader(tr(lang,"actor_topic_network"))
+            tm=R.get("topics",{})
+            topic_options=[]
+            if isinstance(tm.get("nmf_doc_topic"),pd.DataFrame): topic_options.append("NMF")
+            if isinstance(tm.get("lda_doc_topic"),pd.DataFrame): topic_options.append("LDA")
+            if topic_options and not ef.empty:
+                c1,c2,c3=st.columns(3)
+                with c1: topic_method=st.selectbox(tr(lang,"topic_model"),topic_options,key="network_topic_model")
+                with c2: top_e=st.slider(tr(lang,"network_top_entities"),5,60,25,5)
+                with c3: min_w=st.number_input(tr(lang,"minimum_edge"),min_value=0.0,value=0.10,step=0.05)
+                tdf=tm["nmf_doc_topic"] if topic_method=="NMF" else tm["lda_doc_topic"]
+                edges=actor_topic_edges(ef,tdf,R["docs"]["doc_id"].astype(str).tolist(),selected_types,top_e,float(min_w))
+                if edges.empty:
+                    st.info(tr(lang,"not_enough"))
+                else:
+                    fig=actor_topic_network_figure(edges)
+                    if fig is not None: st.plotly_chart(fig,use_container_width=True)
+                    with st.expander(tr(lang,"network_edges")):
+                        st.dataframe(edges,use_container_width=True,hide_index=True)
+                    st.session_state.pm_network_edges=edges
+            else:
+                st.info(tr(lang,"not_enough"))
 
-# ========================================
-# COMPREHENSIVE RESULTS TABLE
-# ========================================
-st.subheader("📈 Comprehensive Results")
-results = pd.DataFrame({
-    "file": [d["filename"] for d in docs],
-    "language": [d["lang"] for d in docs],
-    "tokens_len": [len(c.split()) for c in cleaned],
-    "lda_dominant_topic": dominant_topic,
-    "cluster": clusters,
-    "pca_x": coords[:, 0],
-    "pca_y": coords[:, 1]
-})
+with tab_groups:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'group_note')}</div>", unsafe_allow_html=True)
+    analysis_df = build_analysis_dataset(R)
+    excluded = {"doc_id","text","language","sentiment","sentiment_score","p_positive","p_neutral","p_negative","sentiment_sd","sentiment_chunks"}
+    group_cols = [c for c in R["docs"].columns if c not in excluded and R["docs"][c].nunique(dropna=True) >= 2 and R["docs"][c].nunique(dropna=True) <= 30]
+    if not group_cols:
+        st.info(tr(lang,"not_enough"))
+    else:
+        gcol = st.selectbox(tr(lang,"group_column"), group_cols)
+        vals = [x for x in R["docs"][gcol].dropna().unique().tolist()]
+        c1,c2 = st.columns(2)
+        with c1: ga = st.selectbox(tr(lang,"group_a"), vals, index=0)
+        with c2: gb = st.selectbox(tr(lang,"group_b"), vals, index=1 if len(vals)>1 else 0)
+        if ga == gb:
+            st.warning(tr(lang,"different_groups"))
+        else:
+            ids_a = set(R["docs"].loc[R["docs"][gcol] == ga, "doc_id"].astype(str))
+            ids_b = set(R["docs"].loc[R["docs"][gcol] == gb, "doc_id"].astype(str))
+            cleaned_map = dict(zip(R["docs"]["doc_id"].astype(str), R["cleaned_docs"]))
+            keydf = informative_log_odds([cleaned_map[i] for i in ids_a], [cleaned_map[i] for i in ids_b], 50)
+            st.subheader(tr(lang,"keyness")); st.caption(tr(lang,"keyness_direction")); st.dataframe(keydf,use_container_width=True,hide_index=True)
+            numeric_outcomes=[c for c in analysis_df.columns if c not in {"doc_id","text"} and pd.api.types.is_numeric_dtype(analysis_df[c]) and analysis_df[c].notna().sum()>=4 and analysis_df[c].nunique(dropna=True)>1]
+            if numeric_outcomes:
+                default_idx=numeric_outcomes.index("sentiment_score") if "sentiment_score" in numeric_outcomes else 0
+                outcome=st.selectbox(tr(lang,"outcome"),numeric_outcomes,index=default_idx,key="group_numeric_outcome")
+                tmp=analysis_df[["doc_id",gcol,outcome]].copy()
+                a=pd.to_numeric(tmp.loc[tmp[gcol]==ga,outcome],errors="coerce").dropna().values
+                b=pd.to_numeric(tmp.loc[tmp[gcol]==gb,outcome],errors="coerce").dropna().values
+                testdf=numeric_group_test(a,b); bootdf=bootstrap_difference_ci(a,b,n_boot=3000,random_state=int(st.session_state.pm_params.get("random_state",42)))
+                c1,c2=st.columns(2)
+                with c1:
+                    st.subheader(tr(lang,"inferential_tests")); st.dataframe(testdf,use_container_width=True,hide_index=True) if not testdf.empty else st.info(tr(lang,"not_enough"))
+                with c2:
+                    st.subheader(tr(lang,"bootstrap_ci")); st.dataframe(bootdf,use_container_width=True,hide_index=True) if not bootdf.empty else st.info(tr(lang,"not_enough"))
+                if not bootdf.empty:
+                    st.session_state.pm_group_bootstrap=bootdf.assign(group_variable=str(gcol),group_A=str(ga),group_B=str(gb),outcome=str(outcome))
 
-if not sentiment_df.empty:
-    sentiment_simple = sentiment_df[["document", "sentiment", "score"]].copy()
-    sentiment_simple.columns = ["file", "sentiment", "sentiment_score"]
-    results = results.merge(sentiment_simple, on="file", how="left")
 
-if not bias_df.empty:
-    results = results.merge(bias_df, left_index=True, right_on="doc_id", how="left").drop(columns=["doc_id"])
+with tab_temporal:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'temporal_note')}</div>", unsafe_allow_html=True)
+    analysis_df=build_analysis_dataset(R)
+    meta_cols=[c for c in R["docs"].columns if c not in {"doc_id","text","source_file","language","sentiment","sentiment_score","p_positive","p_neutral","p_negative","sentiment_sd","sentiment_chunks"}]
+    time_candidates=[]
+    for c in meta_cols:
+        name=str(c).lower()
+        ser=R["docs"][c]
+        numeric=pd.to_numeric(ser,errors="coerce")
+        parsed=pd.to_datetime(ser,errors="coerce")
+        if any(k in name for k in ["year","date","time","wave","month","año","fecha","anno","data"]) or numeric.notna().mean()>=.8 or parsed.notna().mean()>=.8:
+            if ser.nunique(dropna=True)>=2: time_candidates.append(c)
+    outcomes=[c for c in analysis_df.columns if pd.api.types.is_numeric_dtype(analysis_df[c]) and analysis_df[c].notna().sum()>=4 and analysis_df[c].nunique(dropna=True)>1]
+    if not time_candidates or not outcomes:
+        st.info(tr(lang,"temporal_need"))
+    else:
+        c1,c2,c3=st.columns(3)
+        with c1: tcol=st.selectbox(tr(lang,"time_variable"),time_candidates)
+        with c2:
+            default_idx=outcomes.index("sentiment_score") if "sentiment_score" in outcomes else 0
+            ycol=st.selectbox(tr(lang,"outcome"),outcomes,index=default_idx,key="time_outcome")
+        with c3:
+            gopts=["—"]+[c for c in meta_cols if c!=tcol and R["docs"][c].nunique(dropna=True) in range(2,16)]
+            tg=st.selectbox(tr(lang,"temporal_group"),gopts)
+        group=None if tg=="—" else tg
+        summary=temporal_bootstrap_summary(analysis_df,tcol,ycol,group_col=group,n_boot=1500,random_state=int(st.session_state.pm_params.get("random_state",42)))
+        trend=robust_time_trend(analysis_df,tcol,ycol,group_col=group)
+        if summary.empty:
+            st.info(tr(lang,"not_enough"))
+        else:
+            summary["err_plus"]=summary["ci_high"]-summary["mean"]; summary["err_minus"]=summary["mean"]-summary["ci_low"]
+            fig=px.line(summary,x="period",y="mean",color=group if group else None,markers=True,error_y="err_plus",error_y_minus="err_minus",title=tr(lang,"temporal_evolution"))
+            st.plotly_chart(fig,use_container_width=True)
+            st.subheader(tr(lang,"robust_trend")); st.dataframe(trend,use_container_width=True,hide_index=True) if not trend.empty else st.info(tr(lang,"not_enough"))
+            with st.expander(tr(lang,"bootstrap_summary")): st.dataframe(summary.drop(columns=["err_plus","err_minus"]),use_container_width=True,hide_index=True)
+            st.session_state.pm_temporal_summary=summary.drop(columns=["err_plus","err_minus"])
+            st.session_state.pm_temporal_trend=trend
 
-st.dataframe(results, use_container_width=True)
+with tab_supervised:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'supervised_note')}</div>", unsafe_allow_html=True)
+    if "doc_embeddings" not in R:
+        st.info(tr(lang,"supervised_need_semantic"))
+    else:
+        label_candidates=[]
+        for c in R["docs"].columns:
+            if c in {"doc_id","text","source_file","language","sentiment","sentiment_score","p_positive","p_neutral","p_negative","sentiment_sd","sentiment_chunks"}: continue
+            n=R["docs"][c].nunique(dropna=True)
+            counts=R["docs"][c].dropna().astype(str).value_counts()
+            if 2<=n<=12 and len(counts)>=2: label_candidates.append(c)
+        if not label_candidates:
+            st.info(tr(lang,"supervised_need_labels"))
+        else:
+            c1,c2=st.columns(2)
+            with c1: task=st.selectbox(tr(lang,"supervised_task"),[tr(lang,"stance_task"),tr(lang,"framing_task"),tr(lang,"other_task")])
+            with c2: label_col=st.selectbox(tr(lang,"label_column"),label_candidates)
+            target=st.text_input(tr(lang,"stance_target"),placeholder=tr(lang,"stance_target_placeholder"))
+            if st.button(tr(lang,"train_classifier"),type="primary",key="train_supervised"):
+                out=supervised_embedding_classifier(np.asarray(R["doc_embeddings"]),R["docs"]["doc_id"].astype(str).tolist(),R["docs"][label_col].tolist(),random_state=int(st.session_state.pm_params.get("random_state",42)))
+                if "error" in out:
+                    st.warning(out["error"])
+                else:
+                    st.session_state.pm_supervised=out
+                    st.session_state.pm_supervised_info=pd.DataFrame([{"task":task,"label_column":label_col,"target":target,"embedding_model":EMBEDDING_MODEL}])
+            out=st.session_state.get("pm_supervised")
+            if isinstance(out,dict) and "metrics" in out:
+                st.subheader(tr(lang,"cv_performance")); st.dataframe(out["metrics"],use_container_width=True,hide_index=True)
+                c1,c2=st.columns(2)
+                with c1:
+                    st.subheader(tr(lang,"confusion_matrix")); cm=out["confusion"].set_index("actual"); st.plotly_chart(px.imshow(cm,text_auto=True,aspect="auto",labels=dict(x="Predicted",y="Actual",color="N")),use_container_width=True)
+                with c2:
+                    st.subheader(tr(lang,"classification_report")); st.dataframe(out["classification_report"],use_container_width=True,hide_index=True)
+                st.subheader(tr(lang,"predictions")); st.dataframe(out["predictions"],use_container_width=True,hide_index=True)
 
-# ========================================
-# EXPORT OPTIONS
-# ========================================
-st.subheader("⬇️ Download Results")
+with tab_models:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'model_note')}</div>", unsafe_allow_html=True)
+    # Build a document-level modelling dataset from metadata + generated indicators.
+    model_df = R["docs"].copy()
+    model_df = model_df.merge(R["frames"], on="doc_id", how="left")
+    model_df = model_df.merge(R["doc_stats"].drop(columns=["source_file","language"], errors="ignore"), on="doc_id", how="left")
+    tm = R.get("topics", {})
+    if isinstance(tm.get("lda_doc_topic"), pd.DataFrame) and len(tm["lda_doc_topic"]) == len(model_df):
+        model_df = pd.concat([model_df.reset_index(drop=True), tm["lda_doc_topic"].reset_index(drop=True)], axis=1)
+    if isinstance(tm.get("nmf_doc_topic"), pd.DataFrame) and len(tm["nmf_doc_topic"]) == len(model_df):
+        model_df = pd.concat([model_df.reset_index(drop=True), tm["nmf_doc_topic"].reset_index(drop=True)], axis=1)
 
-col1, col2, col3 = st.columns(3)
+    outcome_candidates = []
+    for c in model_df.columns:
+        if c in {"text", "doc_id", "source_file"}: continue
+        if pd.api.types.is_numeric_dtype(model_df[c]) and model_df[c].notna().sum() >= 4 and model_df[c].nunique(dropna=True) > 1:
+            if c.startswith("frame_") and c.endswith("_per_1000") or c in {"sentiment_score","mattr_50","type_token_ratio","avg_sentence_words"} or c.startswith("LDA_") or c.startswith("NMF_"):
+                outcome_candidates.append(c)
+    if not outcome_candidates:
+        st.info(tr(lang,"not_enough"))
+    else:
+        ycol = st.selectbox(tr(lang,"outcome"), outcome_candidates)
+        predictor_candidates = []
+        for c in R["docs"].columns:
+            if c in {"doc_id","text","sentiment","sentiment_score","p_positive","p_neutral","p_negative","sentiment_sd","sentiment_chunks"}: continue
+            nun = R["docs"][c].nunique(dropna=True)
+            if 1 < nun <= max(30, len(R["docs"])//2) or pd.api.types.is_numeric_dtype(R["docs"][c]):
+                predictor_candidates.append(c)
+        xcols = st.multiselect(tr(lang,"predictors"), predictor_candidates)
+        if xcols and st.button(tr(lang,"fit_model"), key="fit_ols"):
+            try:
+                import statsmodels.api as sm
+                raw = model_df[[ycol] + xcols].copy()
+                # Treat low-cardinality nonnumeric variables as categorical; numeric variables remain continuous.
+                X = pd.get_dummies(raw[xcols], columns=[c for c in xcols if not pd.api.types.is_numeric_dtype(raw[c])], drop_first=True, dtype=float)
+                X = X.apply(pd.to_numeric, errors="coerce")
+                y = pd.to_numeric(raw[ycol], errors="coerce")
+                dat = pd.concat([y.rename(ycol), X], axis=1).replace([np.inf,-np.inf], np.nan).dropna()
+                X2 = sm.add_constant(dat.drop(columns=[ycol]), has_constant="add")
+                if len(dat) <= X2.shape[1] + 2:
+                    st.warning(tr(lang,"not_enough"))
+                else:
+                    fit = sm.OLS(dat[ycol], X2).fit(cov_type="HC3")
+                    ci = fit.conf_int()
+                    coef = pd.DataFrame({
+                        "term": fit.params.index,
+                        "coefficient": fit.params.values,
+                        "robust_se_HC3": fit.bse.values,
+                        "t": fit.tvalues.values,
+                        "p_value": fit.pvalues.values,
+                        "ci_low_95": ci[0].values,
+                        "ci_high_95": ci[1].values,
+                    })
+                    m1,m2,m3 = st.columns(3)
+                    m1.metric("N", int(fit.nobs)); m2.metric("R²", f"{fit.rsquared:.3f}"); m3.metric("Adj. R²", f"{fit.rsquared_adj:.3f}")
+                    st.subheader(tr(lang,"coef_table"))
+                    st.dataframe(coef, use_container_width=True, hide_index=True)
+                    st.session_state.pm_model_coefficients = coef
+                    st.session_state.pm_model_info = pd.DataFrame([{"outcome":ycol,"predictors":", ".join(xcols),"n":int(fit.nobs),"r_squared":fit.rsquared,"adj_r_squared":fit.rsquared_adj,"covariance":"HC3"}])
+            except Exception as e:
+                st.error(str(e))
 
-if want_csv:
-    with col1:
-        csv_data = results.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Download CSV",
-            data=csv_data,
-            file_name="perspectivemapper_results.csv",
-            mime="text/csv"
-        )
 
-if want_json:
-    with col2:
-        json_data = json.dumps({
-            "summary": {
-                "total_documents": len(docs),
-                "total_topics": n_topics,
-                "total_clusters": k_for_fit
-            },
-            "documents": results.to_dict(orient="records"),
-            "topics": topics_df.to_dict(orient="records") if 'topics_df' in locals() else []
-        }, indent=2).encode("utf-8")
-        st.download_button(
-            label="📥 Download JSON",
-            data=json_data,
-            file_name="perspectivemapper_results.json",
-            mime="application/json"
-        )
+with tab_publication:
+    st.markdown(f"<div class='pm-note'>{tr(lang,'publication_note')}</div>", unsafe_allow_html=True)
+    html_report=make_html_report(R,st.session_state.pm_params,lang)
+    c1,c2=st.columns(2)
+    with c1:
+        st.download_button(tr(lang,"download_report"),html_report,"PerspectiveMapper_v3_1_report.html","text/html",use_container_width=True)
+    with c2:
+        if st.button(tr(lang,"prepare_publication_package"),use_container_width=True,key="prepare_pub_package"):
+            with st.spinner(tr(lang,"preparing_package")):
+                st.session_state.pm_publication_package=publication_package(R,st.session_state.pm_params)
+        if "pm_publication_package" in st.session_state:
+            st.download_button(tr(lang,"download_publication_package"),st.session_state.pm_publication_package,"PerspectiveMapper_v3_1_publication_package.zip","application/zip",use_container_width=True)
+    st.caption(tr(lang,"publication_contents"))
 
-with col3:
-    if st.button("🔄 Reset Analysis"):
-        st.session_state.clear()
-        st.rerun()
+with tab_export:
+    meth = methodology_table(st.session_state.pm_params, R)
+    st.subheader(tr(lang,"methodology"))
+    st.dataframe(meth, use_container_width=True, hide_index=True)
+    st.subheader(tr(lang,"limitations"))
+    st.markdown("""
+- Topic labels are inferred from high-weight terms and still require substantive interpretation by the researcher.
+- Multilingual lexical models operate on surface forms; cross-language equivalence is provided primarily by the multilingual embedding model.
+- Sentiment models can be domain-sensitive and may perform differently across languages, registers and demographic groups.
+- Framing dictionaries measure lexical prevalence, not causality, intention, fairness or discriminatory bias.
+- Significance tests assume suitable independent document-level units; repeated measures or nested corpora require an appropriate multilevel design outside this dashboard.
+    """)
+    sheets = {
+        "Documents": master.drop(columns=["text"], errors="ignore"),
+        "Document_stats": R["doc_stats"],
+        "Chunks": chunks,
+        "Keywords_TFIDF": R["keywords"],
+        "Collocations_PMI": R["collocations"],
+        "Frames": R["frames"],
+        "Methodology": meth,
+    }
+    tm = R.get("topics", {})
+    for key, name in [("lda_topics","LDA_topics"),("lda_doc_topic","LDA_doc_topic"),("nmf_topics","NMF_topics"),("nmf_doc_topic","NMF_doc_topic")]:
+        if key in tm: sheets[name] = tm[key]
+    if "sentiment_docs" in R: sheets["Sentiment_docs"] = R["sentiment_docs"]
+    if "sentiment_chunks" in R: sheets["Sentiment_chunks"] = R["sentiment_chunks"]
+    if "entity_mentions" in R: sheets["Entity_mentions"] = R["entity_mentions"]
+    if "entities" in R: sheets["Entities"] = R["entities"]
+    if "pm_group_bootstrap" in st.session_state: sheets["Group_bootstrap"] = st.session_state.pm_group_bootstrap
+    if "pm_temporal_summary" in st.session_state: sheets["Temporal_summary"] = st.session_state.pm_temporal_summary
+    if "pm_temporal_trend" in st.session_state: sheets["Temporal_trend"] = st.session_state.pm_temporal_trend
+    if "pm_network_edges" in st.session_state: sheets["Actor_topic_edges"] = st.session_state.pm_network_edges
+    if "pm_supervised" in st.session_state and isinstance(st.session_state.pm_supervised,dict):
+        for _k,_name in [("metrics","Supervised_metrics"),("confusion","Supervised_confusion"),("classification_report","Supervised_report"),("predictions","Supervised_predictions")]:
+            if isinstance(st.session_state.pm_supervised.get(_k),pd.DataFrame): sheets[_name]=st.session_state.pm_supervised[_k]
+    if "pm_supervised_info" in st.session_state: sheets["Supervised_info"] = st.session_state.pm_supervised_info
+    if "doc_similarity" in R:
+        sim_export = R["doc_similarity"].reset_index().rename(columns={"doc_id":"doc_id"})
+        sheets["Similarity"] = sim_export
+    if "semantic" in R and isinstance(R["semantic"].get("k_diagnostics"), pd.DataFrame):
+        sheets["Cluster_diagnostics"] = R["semantic"]["k_diagnostics"]
+    if "pm_model_coefficients" in st.session_state:
+        sheets["OLS_coefficients"] = st.session_state.pm_model_coefficients
+    if "pm_model_info" in st.session_state:
+        sheets["OLS_model_info"] = st.session_state.pm_model_info
+    xlsx = excel_bytes(sheets)
+    c1,c2,c3 = st.columns(3)
+    with c1:
+        st.download_button(tr(lang,"download_excel"), xlsx, "PerspectiveMapper_v3_1_results.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    with c2:
+        csv = master.drop(columns=["text"], errors="ignore").to_csv(index=False).encode("utf-8-sig")
+        st.download_button(tr(lang,"download_csv"), csv, "PerspectiveMapper_documents.csv", "text/csv", use_container_width=True)
+    with c3:
+        payload = {
+            "parameters": st.session_state.pm_params,
+            "documents": json_safe(master.drop(columns=["text"], errors="ignore")),
+            "topics": json_safe(R.get("topics", {})),
+            "keywords": json_safe(R.get("keywords")),
+            "entities": json_safe(R.get("entities")),
+            "supervised": json_safe(st.session_state.get("pm_supervised")),
+            "temporal_summary": json_safe(st.session_state.get("pm_temporal_summary")),
+        }
+        st.download_button(tr(lang,"download_json"), json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), "PerspectiveMapper_v3_1_results.json", "application/json", use_container_width=True)
 
 st.markdown("---")
-st.caption("PerspectiveMapper v2.0 - Advanced Discourse Analysis Tool")
+st.caption("PerspectiveMapper v3.1 Research Edition · multilingual, inferential and reproducible text analysis")
