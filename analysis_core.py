@@ -4,6 +4,7 @@ import io
 import json
 import math
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -59,38 +60,115 @@ FALLBACK_STOPWORDS = {
     "de": set("""aber als am an auch auf aus bei bin bis bist da dadurch daher darum das dass dein deine dem den der des die dies diese ein eine einem einen einer eines er es für hat hatte haben hier ich im in ist ja kann kein keine mit muss nach nicht nun oder seid sein seine sind so über um und uns unser unter vom von vor war waren warst was weg weil weiter welche wenn werde werden wie wieder wir wird wo zu zum zur""".split()),
 }
 
-DEFAULT_FRAMES = {
-    "security_threat": [
-        "threat", "danger", "crime", "criminal", "border control", "security", "illegal",
-        "amenaza", "peligro", "delito", "criminal", "control fronterizo", "seguridad", "ilegal",
-        "minaccia", "pericolo", "crimine", "criminale", "controllo delle frontiere", "sicurezza", "illegale",
-    ],
-    "rights_humanitarian": [
-        "rights", "human rights", "protection", "dignity", "solidarity", "asylum", "refugee",
-        "derechos", "derechos humanos", "protección", "dignidad", "solidaridad", "asilo", "refugiado",
-        "diritti", "diritti umani", "protezione", "dignità", "solidarietà", "asilo", "rifugiato",
-    ],
-    "economic_contribution": [
-        "contribution", "labour", "labor", "employment", "skills", "productivity", "tax", "growth",
-        "contribución", "trabajo", "empleo", "competencias", "productividad", "impuestos", "crecimiento",
-        "contributo", "lavoro", "occupazione", "competenze", "produttività", "tasse", "crescita",
-    ],
-    "integration_belonging": [
-        "integration", "inclusion", "belonging", "community", "participation", "citizenship",
-        "integración", "inclusión", "pertenencia", "comunidad", "participación", "ciudadanía",
-        "integrazione", "inclusione", "appartenenza", "comunità", "partecipazione", "cittadinanza",
-    ],
-    "health_vulnerability": [
-        "health", "mental health", "vulnerable", "vulnerability", "care", "wellbeing", "well-being",
-        "salud", "salud mental", "vulnerable", "vulnerabilidad", "cuidados", "bienestar",
-        "salute", "salute mentale", "vulnerabile", "vulnerabilità", "cura", "benessere",
-    ],
-    "climate_environment": [
-        "climate", "climate change", "environment", "drought", "flood", "heat", "disaster",
-        "clima", "cambio climático", "medio ambiente", "sequía", "inundación", "calor", "desastre",
-        "clima", "cambiamento climatico", "ambiente", "siccità", "alluvione", "caldo", "disastro",
-    ],
-}
+DEFAULT_FRAMES = {}
+
+
+
+def _normalise_search_text(value: object, case_sensitive: bool = False, accent_insensitive: bool = True) -> str:
+    text = str(value if value is not None else "")
+    if accent_insensitive:
+        text = "".join(ch for ch in unicodedata.normalize("NFKD", text) if not unicodedata.combining(ch))
+    if not case_sensitive:
+        text = text.casefold()
+    return text
+
+
+def parse_keyword_terms(raw: object) -> List[str]:
+    """Parse a user keyword filter. Separate terms/phrases with comma, semicolon or newline.
+
+    A value without separators is treated as one phrase, so ``climate change`` searches
+    for that phrase rather than two independent tokens.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        parts = [str(x).strip() for x in raw]
+    else:
+        parts = [x.strip() for x in re.split(r"[,;\n]+", str(raw))]
+    out = []
+    seen = set()
+    for x in parts:
+        x = x.strip().strip('"').strip("'")
+        if x and x not in seen:
+            out.append(x); seen.add(x)
+    return out
+
+
+def filter_documents_by_keywords(
+    docs: pd.DataFrame, terms: Sequence[str], mode: str = "ANY", scope: str = "text",
+    metadata_cols: Optional[Sequence[str]] = None, case_sensitive: bool = False,
+    accent_insensitive: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Filter document rows by words/phrases while preserving the document as the unit of analysis.
+
+    Returns the filtered documents plus an audit table with per-document matched terms and counts.
+    ``scope`` can be ``text``, ``metadata`` or ``both``. Matching is boundary-aware and, by
+    default, case- and accent-insensitive.
+    """
+    if docs is None or docs.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    clean_terms = [str(t).strip() for t in terms if str(t).strip()]
+    if not clean_terms:
+        audit = docs[[c for c in ["doc_id"] if c in docs.columns]].copy()
+        audit["keyword_matches"] = ""
+        audit["keyword_match_count"] = 0
+        audit["keyword_filter_kept"] = True
+        return docs.copy(), audit
+
+    scope = str(scope).lower()
+    mode = str(mode).upper()
+    meta = [c for c in (metadata_cols or []) if c in docs.columns and c != "text"]
+    rows = []
+    keep_idx = []
+    for idx, r in docs.iterrows():
+        fields = []
+        if scope in {"text", "both"}:
+            fields.append(str(r.get("text", "")))
+        if scope in {"metadata", "both"}:
+            fields.extend(str(r.get(c, "")) for c in meta if not pd.isna(r.get(c, np.nan)))
+        hay = _normalise_search_text(" ".join(fields), case_sensitive, accent_insensitive)
+        matched = []
+        total = 0
+        for term in clean_terms:
+            needle = _normalise_search_text(term, case_sensitive, accent_insensitive)
+            pattern = r"(?<!\w)" + re.escape(needle) + r"(?!\w)"
+            count = len(re.findall(pattern, hay, flags=re.UNICODE))
+            if count > 0:
+                matched.append(term)
+                total += count
+        kept = (len(matched) == len(clean_terms)) if mode == "ALL" else (len(matched) > 0)
+        if kept:
+            keep_idx.append(idx)
+        rows.append({
+            "doc_id": str(r.get("doc_id", idx)),
+            "keyword_matches": ", ".join(matched),
+            "keyword_match_count": int(total),
+            "keyword_filter_kept": bool(kept),
+        })
+    audit = pd.DataFrame(rows)
+    out = docs.loc[keep_idx].copy()
+    if not out.empty and "doc_id" in out.columns:
+        out = out.merge(audit[["doc_id","keyword_matches","keyword_match_count"]], on="doc_id", how="left")
+    return out.reset_index(drop=True), audit
+
+
+def grouped_numeric_summary(df: pd.DataFrame, group_col: str, outcome_col: str, n_boot: int = 1500, random_state: int = 42) -> pd.DataFrame:
+    """Document-level descriptive summary by a metadata group, with bootstrap mean CIs."""
+    if df is None or df.empty or group_col not in df.columns or outcome_col not in df.columns:
+        return pd.DataFrame()
+    work = df[[group_col, outcome_col]].copy()
+    work[outcome_col] = pd.to_numeric(work[outcome_col], errors="coerce")
+    work = work.dropna(subset=[group_col, outcome_col])
+    rows = []
+    for g, sub in work.groupby(group_col, dropna=False, sort=False):
+        vals = sub[outcome_col].to_numpy(dtype=float)
+        ci = bootstrap_mean_ci(vals, n_boot=n_boot, random_state=random_state)
+        rows.append({
+            group_col: g, "n_documents": int(len(vals)), "mean": float(np.mean(vals)),
+            "median": float(np.median(vals)), "sd": float(np.std(vals, ddof=1)) if len(vals) > 1 else np.nan,
+            "ci_low_95": ci["ci_low"], "ci_high_95": ci["ci_high"],
+        })
+    return pd.DataFrame(rows)
 
 
 def safe_language(text: str) -> str:
