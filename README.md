@@ -273,7 +273,7 @@ The first semantic, sentiment or NER run downloads the corresponding Hugging Fac
 
 ## Streamlit Community Cloud
 
-Use `app.py` as the entry point. No secret is required. To enable optional login, create `.streamlit/secrets.toml` from `.streamlit/secrets.toml.example`.
+Use `app.py` as the entry point (`app_perspectivemapper.py` also works: it only launches `app.py`, for deployments created with that file). No secret is required. To enable optional login, create `.streamlit/secrets.toml` from `.streamlit/secrets.toml.example`.
 
 For limited-memory deployments, leave NER disabled unless actor/entity analysis is needed.
 
