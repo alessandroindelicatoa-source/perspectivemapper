@@ -534,9 +534,17 @@ def topic_models(cleaned_docs: Sequence[str], n_topics: int, max_features: int, 
         cv = CountVectorizer(max_features=max_features, min_df=min_df, max_df=0.95 if n_units >= 30 else 1.0)
         Xc = cv.fit_transform(texts)
         if Xc.shape[1] >= n_topics_eff:
-            lda = LatentDirichletAllocation(
-                n_components=n_topics_eff, max_iter=30, learning_method="batch", random_state=random_state
-            )
+            if n_units > 1000:
+                # Online variational Bayes (Hoffman et al., 2010): about five times faster than
+                # batch updates on corpora of several thousand passages.
+                lda = LatentDirichletAllocation(
+                    n_components=n_topics_eff, max_iter=10, learning_method="online", batch_size=512,
+                    learning_offset=10.0, random_state=random_state,
+                )
+            else:
+                lda = LatentDirichletAllocation(
+                    n_components=n_topics_eff, max_iter=30, learning_method="batch", random_state=random_state
+                )
             W = lda.fit_transform(Xc)
             names = cv.get_feature_names_out()
             rows = []
@@ -546,6 +554,7 @@ def topic_models(cleaned_docs: Sequence[str], n_topics: int, max_features: int, 
             result["lda_topics"] = pd.DataFrame(rows)
             result["lda_doc_topic"] = pd.DataFrame(W, columns=[f"LDA_{i+1}" for i in range(W.shape[1])])
             result["lda_perplexity"] = float(lda.perplexity(Xc))
+            result["lda_learning_method"] = lda.learning_method
             result["lda_top_terms"] = [names[comp.argsort()[::-1][:15]].tolist() for comp in lda.components_]
     except Exception as e:
         result["lda_error"] = str(e)
@@ -879,6 +888,8 @@ def temporal_bootstrap_summary(df: pd.DataFrame, time_col: str, outcome_col: str
                                group_col: Optional[str] = None, n_boot: int = 1500,
                                random_state: int = 42) -> pd.DataFrame:
     """Aggregate an outcome over time with percentile bootstrap CIs."""
+    if time_col == outcome_col:
+        return pd.DataFrame()
     if time_col not in df or outcome_col not in df:
         return pd.DataFrame()
     work = df[[time_col, outcome_col] + ([group_col] if group_col and group_col in df else [])].copy()
@@ -914,6 +925,8 @@ def temporal_bootstrap_summary(df: pd.DataFrame, time_col: str, outcome_col: str
 def robust_time_trend(df: pd.DataFrame, time_col: str, outcome_col: str,
                       group_col: Optional[str] = None) -> pd.DataFrame:
     """HC3 robust linear trend. Datetime coefficients are reported per year."""
+    if time_col == outcome_col:
+        return pd.DataFrame()
     import statsmodels.api as sm
     cols = [time_col, outcome_col] + ([group_col] if group_col and group_col in df else [])
     work = df[cols].copy()
@@ -1126,10 +1139,21 @@ def topic_diversity(top_terms: Sequence[Sequence[str]], top_n: int = 25) -> floa
 
 
 def topic_k_diagnostics(units: Sequence[str], k_values: Sequence[int], max_features: int = 5000,
-                        random_state: int = 42) -> pd.DataFrame:
-    """Fit LDA and NMF for several k and report coherence (NPMI) and diversity."""
+                        random_state: int = 42, max_units: int = 3000, progress=None) -> pd.DataFrame:
+    """Fit LDA and NMF for several k and report coherence (NPMI) and diversity.
+
+    Above ``max_units`` the diagnostics use a fixed random subsample of units, so the
+    comparison across k stays affordable on large corpora.
+    """
+    units = list(units)
+    if len(units) > max_units:
+        idx = np.sort(np.random.default_rng(int(random_state)).choice(len(units), max_units, replace=False))
+        units = [units[i] for i in idx]
     rows = []
-    for k in k_values:
+    k_values = list(k_values)
+    for i, k in enumerate(k_values):
+        if progress is not None:
+            progress(i / max(len(k_values), 1), f"k = {k}")
         res = topic_models(units, int(k), max_features, random_state)
         for m in ["lda", "nmf"]:
             tt = res.get(f"{m}_top_terms")
@@ -1137,7 +1161,8 @@ def topic_k_diagnostics(units: Sequence[str], k_values: Sequence[int], max_featu
                 continue
             coh = topic_coherence_npmi(tt, units, 10)
             rows.append({"model": m.upper(), "k": int(k), "mean_npmi": float(coh["npmi"].mean()),
-                         "min_npmi": float(coh["npmi"].min()), "topic_diversity": topic_diversity(tt, 25)})
+                         "min_npmi": float(coh["npmi"].min()), "topic_diversity": topic_diversity(tt, 25),
+                         "units_used": len(units)})
     return pd.DataFrame(rows)
 
 

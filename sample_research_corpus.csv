@@ -1,0 +1,25 @@
+﻿id,country,source,date,year,group,stance_manual,frame_manual,text
+ES01,Spain,Diario Norte,2022-02-15,2022,A,supportive,rights,"La Comisión Europea destacó que la integración de las personas migrantes exige derechos, empleo y participación en la comunidad."
+ES02,Spain,Diario Norte,2022-05-03,2022,B,restrictive,security,El Gobierno defendió reforzar el control fronterizo y la seguridad ante el aumento de llegadas irregulares.
+ES03,Spain,Agencia Sur,2022-09-21,2022,C,neutral,economic,"El informe presenta cifras de empleo, llegadas y solicitudes de asilo sin recomendar cambios concretos de política."
+EN01,Ireland,Civic News,2022-03-18,2022,A,supportive,"UNHCR argued that refugee protection, dignity and community inclusion should remain central to migration policy.",
+EN02,Ireland,Civic News,2022-07-04,2022,B,restrictive,The minister called for stronger border controls and stricter enforcement of irregular migration rules.,
+EN03,Ireland,Policy Daily,2022-11-12,2022,C,neutral,"The report describes migration, employment and asylum statistics while avoiding a clear policy recommendation.",
+IT01,Italy,Notizie Europa,2023-01-20,2023,A,supportive,"La Commissione europea ha sottolineato diritti, inclusione e partecipazione come elementi centrali dell'integrazione.",
+IT02,Italy,Notizie Europa,2023-04-17,2023,B,restrictive,Il governo ha chiesto controlli di frontiera più rigorosi e misure più severe contro l'immigrazione irregolare.,
+IT03,Italy,Osservatorio,2023-10-02,2023,C,neutral,"Il documento riassume dati su lavoro, asilo e arrivi senza assumere una posizione normativa esplicita.",
+ES04,Spain,Agencia Sur,2024-02-11,2024,A,supportive,ACNUR pidió ampliar la protección y facilitar la inclusión laboral de refugiados y solicitantes de asilo.,
+ES05,Spain,Diario Norte,2024-06-23,2024,B,restrictive,"El ministro insistió en más vigilancia, retornos y control de las fronteras exteriores.",
+ES06,Spain,Agencia Sur,2024-12-08,2024,C,neutral,"La noticia compara datos de entradas, empleo y solicitudes de protección entre 2023 y 2024.",
+EN04,Ireland,Policy Daily,2024-01-29,2024,A,supportive,"The European Commission linked migrant integration to skills recognition, employment and equal access to services.",
+EN05,Ireland,Civic News,2024-08-14,2024,B,restrictive,"Government representatives prioritised enforcement, removals and tighter external-border management.",
+EN06,Ireland,Policy Daily,2024-10-30,2024,C,neutral,Officials published updated figures on arrivals and residence permits without endorsing either expansion or restriction.,
+IT04,Italy,Osservatorio,2025-03-09,2025,A,supportive,"UNHCR ha sostenuto percorsi di inclusione, tutela dei diritti e accesso al lavoro per i rifugiati.",
+IT05,Italy,Notizie Europa,2025-07-16,2025,B,restrictive,"Il ministro ha proposto rimpatri più rapidi, maggiore sorveglianza e controlli più severi alle frontiere.",
+IT06,Italy,Osservatorio,2025-11-05,2025,C,neutral,"L'analisi presenta indicatori su migrazione, occupazione e richieste di asilo senza una valutazione politica conclusiva.",
+ES07,Spain,Diario Norte,2026-01-19,2026,A,supportive,"La Comisión Europea señaló que la participación cívica, la igualdad de derechos y el empleo favorecen la integración.",
+ES08,Spain,Agencia Sur,2026-04-25,2026,B,restrictive,El ejecutivo reclamó controles más intensos y una aplicación estricta de las normas sobre entrada irregular.,
+EN07,Ireland,Civic News,2026-02-13,2026,A,supportive,"UNHCR emphasised protection, social inclusion and access to work as priorities for refugee integration.",
+EN08,Ireland,Policy Daily,2026-05-27,2026,B,restrictive,The government backed tougher border enforcement and faster returns for people without legal status.,
+IT07,Italy,Notizie Europa,2026-02-28,2026,A,supportive,"La Commissione europea ha collegato integrazione, lavoro, partecipazione e tutela dei diritti.",
+IT08,Italy,Osservatorio,2026-06-18,2026,B,restrictive,"Il governo ha indicato sicurezza, controllo delle frontiere e rimpatri come priorità della politica migratoria.",

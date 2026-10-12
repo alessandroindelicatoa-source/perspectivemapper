@@ -118,13 +118,40 @@ def parse_sentiment_output(raw) -> Dict[str, float]:
     return probs
 
 
-def sentiment_chunks(chunks: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+@st.cache_data(show_spinner=False, max_entries=4)
+def embed_texts(texts: Tuple[str, ...], _progress=None) -> np.ndarray:
+    """Passage embeddings, cached on the exact passage texts so that changing topic or
+    dictionary settings does not recompute them."""
+    embedder = get_embedder()
+    out = []
+    step = 256
+    for start in range(0, len(texts), step):
+        if _progress is not None:
+            _progress(start / max(len(texts), 1), f"{start:,}/{len(texts):,}")
+        out.append(embedder.encode(list(texts[start:start + step]), batch_size=32,
+                                   show_progress_bar=False, normalize_embeddings=True))
+    return np.vstack(out) if out else np.zeros((0, 384))
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def sentiment_raw(texts: Tuple[str, ...], _progress=None) -> list:
     pipe = get_sentiment_pipeline()
-    texts = chunks["chunk_text"].astype(str).tolist()
-    rows = []
+    outs = []
     batch = 16
     for start in range(0, len(texts), batch):
-        outs = pipe(texts[start:start+batch], truncation=True, max_length=384, batch_size=batch)
+        if _progress is not None and start % (batch * 8) == 0:
+            _progress(start / max(len(texts), 1), f"{start:,}/{len(texts):,}")
+        outs.extend(pipe(list(texts[start:start + batch]), truncation=True, max_length=384, batch_size=batch))
+    return outs
+
+
+def sentiment_chunks(chunks: pd.DataFrame, progress=None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    texts = chunks["chunk_text"].astype(str).tolist()
+    raw_all = sentiment_raw(tuple(texts), progress)
+    rows = []
+    batch = len(texts) or 1
+    for start in range(0, len(texts), batch):
+        outs = raw_all[start:start+batch]
         for j, raw in enumerate(outs):
             probs = parse_sentiment_output(raw)
             score = probs["positive"] - probs["negative"] if np.isfinite(probs["positive"]) and np.isfinite(probs["negative"]) else np.nan
@@ -518,6 +545,11 @@ def prepare_corpus(uploads, configs, clean_text: bool = True, strip_notes: bool 
     return _prepare_corpus_cached(files, json.dumps(configs, default=str, sort_keys=True), bool(clean_text), bool(strip_notes)).copy()
 
 
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_topic_models(units: Tuple[str, ...], n_topics: int, max_features: int, random_state: int) -> Dict[str, object]:
+    return topic_models(list(units), n_topics, max_features, random_state)
+
+
 def resolve_topic_unit(topic_unit: str, docs: pd.DataFrame) -> str:
     """'auto' fits topics on passages when documents are few or long (e.g. encyclicals)."""
     if topic_unit in {"document", "chunk"}:
@@ -534,6 +566,9 @@ def run_pipeline(docs: pd.DataFrame, chunk_words: int, overlap_words: int, n_top
     def step(frac: float, msg: str):
         if progress is not None:
             progress.progress(min(1.0, frac), text=msg)
+
+    def sub(lo: float, hi: float, label: str):
+        return lambda f, extra="": step(lo + (hi - lo) * f, f"{label} {extra}")
 
     res: Dict[str, object] = {"docs": docs.copy()}
     step(0.02, "Chunking…")
@@ -556,7 +591,8 @@ def run_pipeline(docs: pd.DataFrame, chunk_words: int, overlap_words: int, n_top
         tchunks = build_chunks(docs, chunk_words, 0)
         lang_map = dict(zip(docs["doc_id"].astype(str), docs["language"]))
         tunits = [clean_for_lexical(r.chunk_text, lang_map.get(str(r.doc_id), "und"), extra, lemmatize) for r in tchunks.itertuples()]
-        tm = topic_models(tunits, n_topics, max_features, random_state)
+        step(0.17, f"Topic models… LDA + NMF on {len(tunits):,} passages")
+        tm = dict(cached_topic_models(tuple(tunits), n_topics, max_features, random_state))
         doc_ids = docs["doc_id"].astype(str).tolist()
         for m in ["lda", "nmf"]:
             if isinstance(tm.get(f"{m}_doc_topic"), pd.DataFrame):
@@ -564,7 +600,7 @@ def run_pipeline(docs: pd.DataFrame, chunk_words: int, overlap_words: int, n_top
                 tm[f"{m}_doc_topic"] = aggregate_unit_topics(tm[f"{m}_doc_topic"], tchunks["doc_id"], doc_ids, tchunks["chunk_words"])
         res["topic_units"] = tunits
     else:
-        tm = topic_models(cleaned, n_topics, max_features, random_state)
+        tm = dict(cached_topic_models(tuple(cleaned), n_topics, max_features, random_state))
         res["topic_units"] = cleaned
     for m in ["lda", "nmf"]:
         if tm.get(f"{m}_top_terms"):
@@ -577,11 +613,7 @@ def run_pipeline(docs: pd.DataFrame, chunk_words: int, overlap_words: int, n_top
     if do_semantic and len(chunks):
         step(0.35, "Multilingual embeddings…")
         try:
-            embedder = get_embedder()
-            chunk_emb = embedder.encode(
-                chunks["chunk_text"].astype(str).tolist(), batch_size=32,
-                show_progress_bar=False, normalize_embeddings=True,
-            )
+            chunk_emb = embed_texts(tuple(chunks["chunk_text"].astype(str).tolist()), sub(0.35, 0.62, "Multilingual embeddings…"))
             doc_emb = aggregate_embeddings(chunk_emb, chunks, docs["doc_id"].astype(str).tolist())
             sem_units = chunk_emb if len(chunks) >= 4 else doc_emb
             sem = semantic_clustering(sem_units, auto_k, k_manual, random_state)
@@ -600,7 +632,7 @@ def run_pipeline(docs: pd.DataFrame, chunk_words: int, overlap_words: int, n_top
     if do_sentiment and len(chunks):
         step(0.65, "Sentiment…")
         try:
-            sc, sd = sentiment_chunks(chunks)
+            sc, sd = sentiment_chunks(chunks, sub(0.65, 0.84, "Sentiment…"))
             res["sentiment_chunks"] = sc
             res["sentiment_docs"] = sd
             res["docs"] = res["docs"].merge(sd, on="doc_id", how="left")
@@ -638,6 +670,7 @@ def methodology_table(params: Dict[str, object], results: Dict[str, object]) -> 
         ("Additional stopwords", ", ".join(params.get("extra_stopwords", [])) or "none"),
         ("Topic-model unit", {"chunk": "non-overlapping passages; document mixtures = word-weighted passage means",
                               "document": "whole documents"}.get(results.get("topic_unit"), str(results.get("topic_unit")))),
+        ("LDA estimation", "online variational Bayes (batch size 512, 10 passes) above 1,000 units; batch variational Bayes (30 iterations) otherwise"),
         ("Topic quality", "NPMI coherence of top-10 terms (unit co-occurrence); topic diversity of top-25 terms"),
         ("Chunk size words", params.get("chunk_words")),
         ("Chunk overlap words", params.get("overlap_words")),
@@ -732,7 +765,7 @@ with st.sidebar:
                               format_func=lambda x: tr(lang, f"topic_unit_{x}"), help=tr(lang, "topic_unit_help"))
     max_features = st.slider(tr(lang, "max_features"), 500, 12000, 5000, 500)
     do_semantic = st.checkbox(tr(lang, "semantic"), value=True)
-    do_sentiment = st.checkbox(tr(lang, "sentiment"), value=True)
+    do_sentiment = st.checkbox(tr(lang, "sentiment"), value=False, help=tr(lang, "sentiment_help"))
     do_entities = st.checkbox(tr(lang, "entities_option"), value=False, help=tr(lang, "entities_help"))
     auto_k = st.checkbox(tr(lang, "auto_k"), value=True)
     k_manual = st.slider(tr(lang, "clusters"), 2, 12, 4, disabled=auto_k)
@@ -960,9 +993,12 @@ with tab_topics:
         units = R.get("topic_units") or R["cleaned_docs"]
         ks = list(range(int(k_range[0]), int(k_range[1]) + 1, int(k_step)))
         with st.spinner(tr(lang, "running")):
+            _kp = st.progress(0.0)
             st.session_state.pm_topic_k_diag = topic_k_diagnostics(
                 units, ks, int(st.session_state.pm_params.get("max_features", 5000)),
-                int(st.session_state.pm_params.get("random_state", 42)))
+                int(st.session_state.pm_params.get("random_state", 42)),
+                progress=lambda f, msg: _kp.progress(min(1.0, f), text=msg))
+            _kp.empty()
     kd = st.session_state.get("pm_topic_k_diag")
     if isinstance(kd, pd.DataFrame) and not kd.empty:
         c1, c2 = st.columns(2)
@@ -1349,8 +1385,9 @@ with tab_temporal:
         c1,c2,c3=st.columns(3)
         with c1: tcol=st.selectbox(tr(lang,"time_variable"),time_candidates)
         with c2:
-            default_idx=outcomes.index("sentiment_score") if "sentiment_score" in outcomes else 0
-            ycol=st.selectbox(tr(lang,"outcome"),outcomes,index=default_idx,key="time_outcome")
+            t_outcomes=[c for c in outcomes if c!=tcol]
+            default_idx=t_outcomes.index("sentiment_score") if "sentiment_score" in t_outcomes else 0
+            ycol=st.selectbox(tr(lang,"outcome"),t_outcomes,index=default_idx,key="time_outcome")
         with c3:
             gopts=["—"]+[c for c in meta_cols if c!=tcol and R["docs"][c].nunique(dropna=True) in range(2,16)]
             tg=st.selectbox(tr(lang,"temporal_group"),gopts)

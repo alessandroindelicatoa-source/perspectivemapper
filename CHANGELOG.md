@@ -23,6 +23,10 @@
 - Removed `secrets.toml`, `runtime.txt`, `package.json`, the duplicate root `config.toml`, the v2 app and obsolete documents; added `.gitignore`.
 - Constant-time password comparison and optional `sha256:` password hashes.
 - Added unit tests for `analysis_core.py`.
+- LDA uses online variational Bayes above 1,000 passages (about 4× faster on a 39-encyclical corpus); topic fits, embeddings and sentiment are cached.
+- Progress bar reports passage counts during embeddings and sentiment; k diagnostics use a fixed 3,000-passage subsample on large corpora.
+- Sentiment is off by default (domain mismatch with doctrinal texts; slowest step).
+- Fixed a crash in the Temporal tab when the time variable was also chosen as the outcome.
 - New outputs added to the Excel, JSON, HTML report and publication package.
 
 ## v3.2 Corpus & Grouping Edition

@@ -767,3 +767,7 @@ T["it"]["frame_note"] = "Indicatori lessicometrici basati sul tuo dizionario (am
 T["es"]["frames"] = "Diccionarios y concordancias"
 T["en"]["frames"] = "Dictionaries and concordance"
 T["it"]["frames"] = "Dizionari e concordanze"
+
+T["es"]["sentiment_help"] = "Desactivado por defecto: el modelo se entrenó con reseñas y textos breves, y en corpus largos es el paso más lento."
+T["en"]["sentiment_help"] = "Off by default: the model was trained on reviews and short texts, and on long corpora it is the slowest step."
+T["it"]["sentiment_help"] = "Disattivato per impostazione predefinita: il modello è addestrato su recensioni e testi brevi e nei corpus lunghi è il passaggio più lento."
