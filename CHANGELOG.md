@@ -1,5 +1,30 @@
 # Changelog
 
+## v3.3 Doctrine & Concepts Edition
+
+- Added PDF/DOCX text cleaning: page numbers, running headers/footers, line-end hyphenation and hard line wraps.
+- Added optional removal of the final notes section and `[n]` markers.
+- Added `simplemma` lemmatisation for lexical analysis and topic models.
+- Added researcher-defined stopwords.
+- Added passage-level topic estimation with word-weighted aggregation to documents (`Automatic`, `Passages`, `Documents`).
+- Added NPMI coherence per topic, topic diversity per model and a k-diagnostics panel.
+- Raised the maximum number of topics from 12 to 30.
+- Added wildcard (`*`), accent-insensitive and line-break-tolerant dictionary matching, plus a dictionary audit table.
+- KWIC now uses whole-word, wildcard-aware matching and keeps the original spelling.
+- Added the Concepts tab: semantic projection of passages onto researcher-defined anchor sentences, with mean, centred and share measures, validation passages, and integration into grouped, temporal, comparison and regression tabs.
+- Fixed document similarity, which was not a cosine similarity because averaged embeddings were not re-normalised.
+- Sentiment document scores are now word-weighted.
+- Silhouette scores use a fixed subsample above 3,000 units; bootstrap resampling is vectorised.
+- Uploaded files are parsed once and cached.
+- Added a progress bar for the main analysis.
+- Excel export is built on request.
+- Replaced deprecated `use_container_width` with `width="stretch"`; requires Streamlit ≥ 1.51.
+- CPU-only PyTorch index in `requirements.txt`.
+- Removed `secrets.toml`, `runtime.txt`, `package.json`, the duplicate root `config.toml`, the v2 app and obsolete documents; added `.gitignore`.
+- Constant-time password comparison and optional `sha256:` password hashes.
+- Added unit tests for `analysis_core.py`.
+- New outputs added to the Excel, JSON, HTML report and publication package.
+
 ## v3.2 Corpus & Grouping Edition
 
 - Added automatic detection of split long-text families such as `texto`, `texto_2`, …, `texto_10`.

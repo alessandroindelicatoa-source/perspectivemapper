@@ -5,6 +5,7 @@ import json
 import math
 import re
 import unicodedata
+import warnings
 from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -39,6 +40,12 @@ try:
     _HAS_NLTK = True
 except Exception:
     _HAS_NLTK = False
+
+try:
+    import simplemma
+    _HAS_SIMPLEMMA = True
+except Exception:
+    _HAS_SIMPLEMMA = False
 
 
 EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -216,10 +223,149 @@ def tokenize(text: str) -> List[str]:
     return re.findall(r"[^\W\d_][^\W_]*(?:['’\-][^\W\d_]+)?", text.lower(), flags=re.UNICODE)
 
 
-def clean_for_lexical(text: str, lang: str, extra_stop: Optional[Iterable[str]] = None) -> str:
+_LEMMA_CACHE: Dict[Tuple[str, str], str] = {}
+
+
+def lemmatizer_available() -> bool:
+    return _HAS_SIMPLEMMA
+
+
+def lemmatize_token(token: str, lang: str) -> str:
+    """Dictionary-based lemma (simplemma). Unknown languages/tokens are returned unchanged."""
+    if not _HAS_SIMPLEMMA or not lang or lang == "und":
+        return token
+    key = (lang, token)
+    hit = _LEMMA_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        lemma = str(simplemma.lemmatize(token, lang=lang)).lower()
+    except Exception:
+        lemma = token
+    if len(_LEMMA_CACHE) < 500_000:
+        _LEMMA_CACHE[key] = lemma
+    return lemma
+
+
+def clean_for_lexical(text: str, lang: str, extra_stop: Optional[Iterable[str]] = None,
+                      lemmatize: bool = False) -> str:
+    """Lower-cased content tokens for lexical models.
+
+    Stopwords are removed before and, when ``lemmatize`` is true, again after lemmatisation,
+    so that inflected function words (e.g. "sus" -> "su") do not re-enter the vocabulary.
+    """
     sw = get_stopwords(lang, extra_stop)
     toks = [t for t in tokenize(text) if len(t) >= 3 and t not in sw]
+    if lemmatize:
+        toks = [lemmatize_token(t, lang) for t in toks]
+        toks = [t for t in toks if len(t) >= 3 and t not in sw]
     return " ".join(toks)
+
+
+# ---------------------------------------------------------------------------
+# Extracted-text cleaning (PDF/DOCX). Designed for institutional PDFs such as the
+# vatican.va encyclicals: running headers/footers, page numbers, hyphenation at line
+# ends, hard line wraps and end-of-document notes.
+# ---------------------------------------------------------------------------
+
+_NOTES_HEADINGS = r"(?:notas|notes|note|anmerkungen|notes?\s+et\s+r[ée]f[ée]rences|notas\s+finales|riferimenti)"
+
+
+def _header_key(line: str) -> str:
+    return re.sub(r"\d+", "#", re.sub(r"\s+", " ", line.strip().lower()))
+
+
+def find_repeated_page_lines(pages: Sequence[str], edge_lines: int = 2, min_share: float = 0.4) -> set:
+    """Lines (digits normalised) that recur at the top/bottom of many pages."""
+    n = len(pages)
+    if n < 3:
+        return set()
+    counts: Counter = Counter()
+    for p in pages:
+        lines = [l for l in str(p).splitlines() if l.strip()]
+        if len(lines) < 3:
+            continue  # too short to tell headers from body text
+        edge = lines[:edge_lines] + lines[-edge_lines:]
+        # Running heads are short and rarely end like a sentence; body lines that happen to
+        # recur (e.g. a repeated formula) usually do, so they are not treated as headers.
+        counts.update({_header_key(l) for l in edge
+                       if len(l.strip()) <= 120 and (len(l.strip()) <= 25 or not re.search(r"[.;:!?»”\"]$", l.strip()))})
+    threshold = max(3, int(math.ceil(min_share * n)))
+    return {k for k, c in counts.items() if c >= threshold}
+
+
+def clean_extracted_text(text: str, repeated_lines: Optional[set] = None, strip_notes: bool = False) -> str:
+    """Repair common PDF-extraction artefacts while keeping paragraph boundaries."""
+    if not text:
+        return ""
+    t = unicodedata.normalize("NFC", str(text))
+    t = t.replace("­", "").replace("ﬁ", "fi").replace("ﬂ", "fl").replace("ﬀ", "ff")
+    t = t.replace("\r\n", "\n").replace("\r", "\n").replace(" ", " ")
+    lines = t.split("\n")
+    rep = repeated_lines or set()
+    kept = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            kept.append("")
+            continue
+        if re.fullmatch(r"[-–—\s]*\d{1,4}[-–—\s]*", s) or re.fullmatch(r"(?i)(page|p[áa]g(?:ina)?\.?|pagina)\s*\d+(\s*(of|de|di)\s*\d+)?", s):
+            continue
+        if rep and _header_key(s) in rep:
+            continue
+        kept.append(s)
+    t = "\n".join(kept)
+    if strip_notes:
+        m = None
+        for m_ in re.finditer(rf"(?im)^\s*{_NOTES_HEADINGS}\s*:?\s*$", t):
+            m = m_
+        if m is not None and m.start() >= 0.5 * len(t):
+            t = t[:m.start()]
+        t = re.sub(r"\[\d{1,3}\]", "", t)
+    # Hyphenation across line breaks: "eco-\nnomía" -> "economía" (only before lower case).
+    t = re.sub(r"(\w)[-‐]\n(?=[a-zà-öø-ÿ])", r"\1", t)
+    # Re-join hard-wrapped lines inside paragraphs; blank lines remain paragraph breaks.
+    t = re.sub(r"(?<![.!?:;»\"”])\n(?!\n)(?=\S)", " ", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+# ---------------------------------------------------------------------------
+# Dictionary matching with wildcards and accent-insensitive search
+# ---------------------------------------------------------------------------
+
+def compile_term_pattern(term: str, accent_insensitive: bool = True) -> Optional[re.Pattern]:
+    """Compile a dictionary entry. ``*`` is a word-internal wildcard: ``salari*``, ``*capital*``.
+
+    Matching is whole-word, case-insensitive and (optionally) accent-insensitive. Multi-word
+    entries tolerate any amount of whitespace between words.
+    """
+    raw = _normalise_search_text(str(term).strip(), False, accent_insensitive)
+    if not raw or raw.replace("*", "").strip() == "":
+        return None
+    parts = [re.escape(p) for p in raw.split("*")]
+    body = r"\w*".join(parts)
+    body = re.sub(r"(\\ )+", r"\\s+", body)
+    return re.compile(r"(?<!\w)" + body + r"(?!\w)", flags=re.UNICODE)
+
+
+def dictionary_term_counts(docs: pd.DataFrame, frame_dict: Dict[str, List[str]],
+                           accent_insensitive: bool = True) -> pd.DataFrame:
+    """Long audit table: hits of every dictionary entry in every document (non-zero rows only)."""
+    compiled = {(cat, str(term)): compile_term_pattern(term, accent_insensitive)
+                for cat, terms in frame_dict.items() for term in (terms or [])}
+    rows = []
+    for _, r in docs.iterrows():
+        hay = _normalise_search_text(r["text"], False, accent_insensitive)
+        for (cat, term), pat in compiled.items():
+            if pat is None:
+                continue
+            hits = pat.findall(hay)
+            if hits:
+                rows.append({"doc_id": r["doc_id"], "category": cat, "entry": term, "hits": len(hits),
+                             "matched_forms": ", ".join(sorted(set(hits))[:15])})
+    return pd.DataFrame(rows, columns=["doc_id", "category", "entry", "hits", "matched_forms"])
 
 
 def split_sentences(text: str) -> List[str]:
@@ -382,8 +528,10 @@ def topic_models(cleaned_docs: Sequence[str], n_topics: int, max_features: int, 
     if n_units < 2:
         return result
     n_topics_eff = max(2, min(int(n_topics), max(2, n_units)))
+    # With many units, terms that occur in a single unit add noise and slow both models.
+    min_df = 2 if n_units >= 30 else 1
     try:
-        cv = CountVectorizer(max_features=max_features, min_df=1, max_df=0.98)
+        cv = CountVectorizer(max_features=max_features, min_df=min_df, max_df=0.95 if n_units >= 30 else 1.0)
         Xc = cv.fit_transform(texts)
         if Xc.shape[1] >= n_topics_eff:
             lda = LatentDirichletAllocation(
@@ -398,10 +546,11 @@ def topic_models(cleaned_docs: Sequence[str], n_topics: int, max_features: int, 
             result["lda_topics"] = pd.DataFrame(rows)
             result["lda_doc_topic"] = pd.DataFrame(W, columns=[f"LDA_{i+1}" for i in range(W.shape[1])])
             result["lda_perplexity"] = float(lda.perplexity(Xc))
+            result["lda_top_terms"] = [names[comp.argsort()[::-1][:15]].tolist() for comp in lda.components_]
     except Exception as e:
         result["lda_error"] = str(e)
     try:
-        tv = TfidfVectorizer(max_features=max_features, min_df=1, max_df=0.98, sublinear_tf=True)
+        tv = TfidfVectorizer(max_features=max_features, min_df=min_df, max_df=0.95 if n_units >= 30 else 1.0, sublinear_tf=True)
         Xt = tv.fit_transform(texts)
         if Xt.shape[1] >= n_topics_eff:
             nmf = NMF(n_components=n_topics_eff, init="nndsvda", random_state=random_state, max_iter=1000, tol=1e-4)
@@ -414,9 +563,22 @@ def topic_models(cleaned_docs: Sequence[str], n_topics: int, max_features: int, 
             result["nmf_topics"] = pd.DataFrame(rows)
             result["nmf_doc_topic"] = pd.DataFrame(Wn, columns=[f"NMF_{i+1}" for i in range(Wn.shape[1])])
             result["nmf_reconstruction_error"] = float(nmf.reconstruction_err_)
+            result["nmf_top_terms"] = [names[comp.argsort()[::-1][:15]].tolist() for comp in nmf.components_]
     except Exception as e:
         result["nmf_error"] = str(e)
     return result
+
+
+def _n_init(n: int) -> int:
+    return 20 if n <= 1000 else 5
+
+
+def _silhouette(emb: np.ndarray, labels: np.ndarray, random_state: int = 42, max_n: int = 3000) -> float:
+    """Cosine silhouette; estimated on a fixed random subsample for large corpora (O(n^2))."""
+    n = len(emb)
+    if n > max_n:
+        return float(silhouette_score(emb, labels, metric="cosine", sample_size=max_n, random_state=random_state))
+    return float(silhouette_score(emb, labels, metric="cosine"))
 
 
 def choose_k(embeddings: np.ndarray, max_k: int = 8, random_state: int = 42) -> Tuple[int, pd.DataFrame]:
@@ -427,11 +589,12 @@ def choose_k(embeddings: np.ndarray, max_k: int = 8, random_state: int = 42) -> 
     upper = min(max_k, n - 1)
     best_k, best_s = 2, -np.inf
     for k in range(2, upper + 1):
-        labels = KMeans(n_clusters=k, random_state=random_state, n_init=20).fit_predict(embeddings)
+        labels = KMeans(n_clusters=k, random_state=random_state, n_init=_n_init(n)).fit_predict(embeddings)
         if len(set(labels)) < 2:
             continue
-        s = silhouette_score(embeddings, labels, metric="cosine")
-        rows.append({"k": k, "silhouette": float(s)})
+        s = _silhouette(embeddings, labels, random_state)
+        db = davies_bouldin_score(embeddings, labels)
+        rows.append({"k": k, "silhouette": float(s), "davies_bouldin": float(db)})
         if s > best_s:
             best_s, best_k = s, k
     return best_k, pd.DataFrame(rows)
@@ -456,8 +619,8 @@ def semantic_clustering(
         sil = np.nan
         db = np.nan
     else:
-        labels = KMeans(n_clusters=k, random_state=random_state, n_init=20).fit_predict(emb)
-        sil = silhouette_score(emb, labels, metric="cosine") if len(set(labels)) > 1 and n > k else np.nan
+        labels = KMeans(n_clusters=k, random_state=random_state, n_init=_n_init(n)).fit_predict(emb)
+        sil = _silhouette(emb, labels, random_state) if len(set(labels)) > 1 and n > k else np.nan
         db = davies_bouldin_score(emb, labels) if len(set(labels)) > 1 else np.nan
     ncomp = min(2, n, emb.shape[1])
     coords0 = PCA(n_components=ncomp, random_state=random_state).fit_transform(emb)
@@ -477,7 +640,9 @@ def aggregate_embeddings(chunk_embeddings: np.ndarray, chunks: pd.DataFrame, doc
     for doc_id in doc_ids:
         idx = np.where(chunks["doc_id"].astype(str).values == str(doc_id))[0]
         arr.append(np.mean(chunk_embeddings[idx], axis=0) if len(idx) else np.zeros(chunk_embeddings.shape[1]))
-    return np.vstack(arr)
+    # Re-normalise: the mean of unit vectors is shorter than 1, so dot products of the raw
+    # means are not cosine similarities.
+    return normalize(np.vstack(arr))
 
 
 def hierarchy_from_embeddings(embeddings: np.ndarray):
@@ -488,49 +653,54 @@ def hierarchy_from_embeddings(embeddings: np.ndarray):
     return linkage(dist, method="average")
 
 
-def frame_indicators(docs: pd.DataFrame, frame_dict: Dict[str, List[str]]) -> pd.DataFrame:
+def frame_indicators(docs: pd.DataFrame, frame_dict: Dict[str, List[str]],
+                     accent_insensitive: bool = True) -> pd.DataFrame:
+    """Dictionary hits per document and per 1,000 tokens (wildcards ``*`` allowed)."""
+    compiled = {frame: [p for p in (compile_term_pattern(t, accent_insensitive) for t in (terms or [])) if p is not None]
+                for frame, terms in (frame_dict or {}).items()}
     rows = []
     for _, r in docs.iterrows():
-        text = str(r["text"]).lower()
-        n = max(len(tokenize(text)), 1)
+        hay = _normalise_search_text(r["text"], False, accent_insensitive)
+        n = max(len(tokenize(r["text"])), 1)
         row = {"doc_id": r["doc_id"]}
-        for frame, terms in frame_dict.items():
-            hits = 0
-            for term in terms:
-                term = str(term).strip().lower()
-                if not term:
-                    continue
-                pattern = r"(?<!\w)" + re.escape(term) + r"(?!\w)"
-                hits += len(re.findall(pattern, text, flags=re.UNICODE))
+        for frame, pats in compiled.items():
+            hits = sum(len(p.findall(hay)) for p in pats)
             row[f"frame_{frame}_count"] = hits
             row[f"frame_{frame}_per_1000"] = hits * 1000.0 / n
         rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["doc_id"])
 
 
-def kwic(docs: pd.DataFrame, term: str, context_words: int = 12, max_hits: int = 100) -> pd.DataFrame:
-    term = str(term).strip()
-    if not term:
-        return pd.DataFrame(columns=["doc_id", "left", "match", "right"])
+def kwic(docs: pd.DataFrame, term: str, context_words: int = 12, max_hits: int = 100,
+         accent_insensitive: bool = True) -> pd.DataFrame:
+    """Keyword-in-context with whole-word, wildcard-aware, accent-insensitive matching.
+
+    Matching runs on a normalised copy of the text; because NFKD accent stripping can change
+    string length, matching is done token by token so the displayed context keeps the
+    original spelling.
+    """
+    cols = ["doc_id", "left", "match", "right"]
+    pat = compile_term_pattern(term, accent_insensitive)
+    if pat is None:
+        return pd.DataFrame(columns=cols)
+    n_words = max(1, len(str(term).split()))
     rows = []
-    pattern = re.compile(re.escape(term), flags=re.I | re.UNICODE)
     for _, r in docs.iterrows():
         words = re.findall(r"\S+", str(r["text"]))
-        # Character-free KWIC based on token windows, matching within tokens/phrases reconstructed.
-        joined = " ".join(words)
-        for m in pattern.finditer(joined):
-            before = joined[:m.start()].split()
-            match = joined[m.start():m.end()]
-            after = joined[m.end():].split()
-            rows.append({
-                "doc_id": r["doc_id"],
-                "left": " ".join(before[-context_words:]),
-                "match": match,
-                "right": " ".join(after[:context_words]),
-            })
-            if len(rows) >= max_hits:
-                return pd.DataFrame(rows)
-    return pd.DataFrame(rows)
+        norm = [_normalise_search_text(re.sub(r"^\W+|\W+$", "", w), False, accent_insensitive) for w in words]
+        for i in range(len(words)):
+            window = " ".join(norm[i:i + n_words])
+            m = pat.match(window)
+            if m and m.start() == 0 and (m.end() == len(window) or not window[m.end()].isalnum()):
+                rows.append({
+                    "doc_id": r["doc_id"],
+                    "left": " ".join(words[max(0, i - context_words):i]),
+                    "match": " ".join(words[i:i + n_words]),
+                    "right": " ".join(words[i + n_words:i + n_words + context_words]),
+                })
+                if len(rows) >= max_hits:
+                    return pd.DataFrame(rows, columns=cols)
+    return pd.DataFrame(rows, columns=cols)
 
 
 def hedges_g(a: Sequence[float], b: Sequence[float]) -> float:
@@ -635,6 +805,18 @@ def json_safe(obj):
 # v3.1 research utilities: bootstrap, temporal inference and supervised stance
 # ---------------------------------------------------------------------------
 
+def _boot_means(x: np.ndarray, n_boot: int, rng: np.random.Generator, block: int = 2_000_000) -> np.ndarray:
+    """Vectorised bootstrap means, processed in blocks to bound memory."""
+    n = len(x)
+    out = np.empty(n_boot, dtype=float)
+    step = max(1, block // max(n, 1))
+    for start in range(0, n_boot, step):
+        stop = min(n_boot, start + step)
+        idx = rng.integers(0, n, size=(stop - start, n))
+        out[start:stop] = x[idx].mean(axis=1)
+    return out
+
+
 def bootstrap_mean_ci(values: Sequence[float], n_boot: int = 2000, confidence: float = 0.95,
                       random_state: int = 42) -> Dict[str, float]:
     """Percentile bootstrap CI for a document-level mean."""
@@ -647,9 +829,7 @@ def bootstrap_mean_ci(values: Sequence[float], n_boot: int = 2000, confidence: f
         return {"n": 1, "mean": v, "ci_low": v, "ci_high": v}
     rng = np.random.default_rng(int(random_state))
     n_boot = max(200, int(n_boot))
-    sims = np.empty(n_boot, dtype=float)
-    for i in range(n_boot):
-        sims[i] = np.mean(rng.choice(x, size=len(x), replace=True))
+    sims = _boot_means(x, n_boot, rng)
     alpha = (1.0 - float(confidence)) / 2.0
     return {
         "n": int(len(x)),
@@ -668,11 +848,7 @@ def bootstrap_difference_ci(a: Sequence[float], b: Sequence[float], n_boot: int 
         return pd.DataFrame()
     rng = np.random.default_rng(int(random_state))
     n_boot = max(500, int(n_boot))
-    sims = np.empty(n_boot, dtype=float)
-    for i in range(n_boot):
-        aa = rng.choice(a, size=len(a), replace=True)
-        bb = rng.choice(b, size=len(b), replace=True)
-        sims[i] = np.mean(aa) - np.mean(bb)
+    sims = _boot_means(a, n_boot, rng) - _boot_means(b, n_boot, rng)
     alpha = (1.0 - float(confidence)) / 2.0
     return pd.DataFrame([{
         "n_A": int(len(a)), "n_B": int(len(b)),
@@ -691,7 +867,9 @@ def infer_time_values(series: pd.Series) -> Tuple[pd.Series, str]:
     # Four-digit years and other mostly numeric time indexes are kept numeric.
     if numeric.notna().mean() >= 0.75:
         return numeric.astype(float), "numeric"
-    parsed = pd.to_datetime(s, errors="coerce", utc=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        parsed = pd.to_datetime(s, errors="coerce", utc=False)
     if parsed.notna().mean() >= 0.60:
         return parsed, "datetime"
     return pd.Series(np.nan, index=s.index, dtype=float), "invalid"
@@ -873,3 +1051,174 @@ def actor_topic_edges(entities: pd.DataFrame, doc_topic: pd.DataFrame, doc_ids: 
                 rows.append({"entity": entity, "entity_type": etype, "topic": tc,
                              "weight": w, "documents": int(sub.loc[pd.to_numeric(sub[tc], errors="coerce").fillna(0) > 0, "doc_id"].nunique())})
     return pd.DataFrame(rows).sort_values("weight", ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# v3.3: chunk-level topic models, coherence diagnostics and concept projection
+# ---------------------------------------------------------------------------
+
+def aggregate_unit_topics(unit_topic: pd.DataFrame, unit_doc_ids: Sequence[str], doc_ids: Sequence[str],
+                          unit_weights: Optional[Sequence[float]] = None) -> pd.DataFrame:
+    """Length-weighted mean of unit (chunk) topic mixtures per document, re-normalised to sum to 1.
+
+    NMF weights are not probabilities; after row-normalisation they are read as each topic's
+    share of the document's topical loading.
+    """
+    if unit_topic is None or unit_topic.empty:
+        return pd.DataFrame()
+    W = unit_topic.to_numpy(dtype=float)
+    W = W / np.clip(W.sum(axis=1, keepdims=True), 1e-12, None)
+    w = np.ones(len(W)) if unit_weights is None else np.asarray(unit_weights, dtype=float)
+    ids = np.asarray(list(map(str, unit_doc_ids)))
+    rows = []
+    for d in map(str, doc_ids):
+        m = ids == d
+        if not m.any() or w[m].sum() <= 0:
+            rows.append(np.full(W.shape[1], np.nan))
+            continue
+        v = (W[m] * w[m, None]).sum(axis=0) / w[m].sum()
+        rows.append(v / max(v.sum(), 1e-12))
+    return pd.DataFrame(rows, columns=unit_topic.columns)
+
+
+def topic_coherence_npmi(top_terms: Sequence[Sequence[str]], units: Sequence[str], top_n: int = 10) -> pd.DataFrame:
+    """Mean pairwise NPMI of each topic's top terms, using unit-level co-occurrence.
+
+    Computed on the same units used to fit the model (an intrinsic measure). Values range
+    from -1 to 1; higher means the top terms co-occur more than chance.
+    """
+    tops = [[t for t in list(terms)[:top_n] if " " not in t] for terms in top_terms]
+    vocab = sorted({t for ts in tops for t in ts})
+    N = len(units)
+    if N == 0 or not vocab:
+        return pd.DataFrame({"topic": range(1, len(tops) + 1), "npmi": np.nan})
+    pos = {w: i for i, w in enumerate(vocab)}
+    X = np.zeros((N, len(vocab)), dtype=np.float32)
+    for r, u in enumerate(units):
+        for w in set(str(u).split()):
+            j = pos.get(w)
+            if j is not None:
+                X[r, j] = 1.0
+    df_ = X.sum(axis=0)
+    co = X.T @ X
+    rows = []
+    for k, terms in enumerate(tops):
+        vals = []
+        for i in range(len(terms)):
+            for j in range(i + 1, len(terms)):
+                a, b = pos[terms[i]], pos[terms[j]]
+                da, db, dab = df_[a], df_[b], co[a, b]
+                if da == 0 or db == 0:
+                    continue
+                if dab == 0:
+                    vals.append(-1.0)
+                    continue
+                p_ab, p_a, p_b = dab / N, da / N, db / N
+                vals.append(1.0 if p_ab >= 1.0 else math.log(p_ab / (p_a * p_b)) / -math.log(p_ab))
+        rows.append({"topic": k + 1, "npmi": float(np.mean(vals)) if vals else np.nan})
+    return pd.DataFrame(rows)
+
+
+def topic_diversity(top_terms: Sequence[Sequence[str]], top_n: int = 25) -> float:
+    """Share of unique words among all topics' top-n terms (Dieng et al., 2020)."""
+    allw = [w for t in top_terms for w in list(t)[:top_n]]
+    return float(len(set(allw)) / len(allw)) if allw else np.nan
+
+
+def topic_k_diagnostics(units: Sequence[str], k_values: Sequence[int], max_features: int = 5000,
+                        random_state: int = 42) -> pd.DataFrame:
+    """Fit LDA and NMF for several k and report coherence (NPMI) and diversity."""
+    rows = []
+    for k in k_values:
+        res = topic_models(units, int(k), max_features, random_state)
+        for m in ["lda", "nmf"]:
+            tt = res.get(f"{m}_top_terms")
+            if not tt:
+                continue
+            coh = topic_coherence_npmi(tt, units, 10)
+            rows.append({"model": m.upper(), "k": int(k), "mean_npmi": float(coh["npmi"].mean()),
+                         "min_npmi": float(coh["npmi"].min()), "topic_diversity": topic_diversity(tt, 25)})
+    return pd.DataFrame(rows)
+
+
+def parse_concept_anchors(raw: object) -> Dict[str, List[str]]:
+    """Parse concept anchors from JSON ({"concept": ["anchor text", ...]}) or from lines
+    ``concept: anchor text`` (several lines may share a concept)."""
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        data = raw
+    else:
+        txt = str(raw).strip()
+        if not txt:
+            return {}
+        if txt.startswith("{"):
+            data = json.loads(txt)
+        else:
+            data = {}
+            for line in txt.splitlines():
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                if k.strip() and v.strip():
+                    data.setdefault(k.strip(), []).append(v.strip())
+    out = {}
+    for k, v in data.items():
+        vals = [v] if isinstance(v, str) else list(v or [])
+        vals = [str(x).strip() for x in vals if str(x).strip()]
+        if str(k).strip() and vals:
+            out[str(k).strip()] = vals
+    return out
+
+
+def concept_projection(chunk_emb: np.ndarray, chunks: pd.DataFrame, doc_ids: Sequence[str],
+                       concept_emb: Dict[str, np.ndarray], threshold: float = 0.45,
+                       top_passages: int = 8) -> Dict[str, pd.DataFrame]:
+    """Semantic projection of every chunk onto researcher-defined concept anchors.
+
+    Each concept is the normalised centroid of its anchor embeddings. For every document the
+    function reports the word-weighted mean cosine similarity of its chunks to each concept,
+    the same score centred on the corpus mean (useful for comparing concepts whose raw
+    similarity levels differ), and the share of the document's words in chunks whose closest
+    concept is that one with similarity >= ``threshold``.
+    """
+    E = normalize(np.asarray(chunk_emb, dtype=float))
+    names = list(concept_emb.keys())
+    if not names or len(E) == 0:
+        return {"documents": pd.DataFrame(), "passages": pd.DataFrame(), "chunks": pd.DataFrame()}
+    C = normalize(np.vstack([np.mean(np.atleast_2d(concept_emb[n]), axis=0) for n in names]))
+    S = E @ C.T
+    words = pd.to_numeric(chunks.get("chunk_words", pd.Series(np.ones(len(E)))), errors="coerce").fillna(1).to_numpy()
+    words = np.clip(words, 1, None)
+    nearest = S.argmax(axis=1)
+    assigned = S.max(axis=1) >= float(threshold)
+    corpus_mean = (S * words[:, None]).sum(axis=0) / words.sum()
+    ids = chunks["doc_id"].astype(str).to_numpy()
+    rows = []
+    for d in map(str, doc_ids):
+        m = ids == d
+        rec = {"doc_id": d}
+        for j, n in enumerate(names):
+            if not m.any():
+                rec[f"concept_{n}_mean"] = np.nan
+                rec[f"concept_{n}_centred"] = np.nan
+                rec[f"concept_{n}_share"] = np.nan
+                continue
+            w = words[m]
+            mean = float((S[m, j] * w).sum() / w.sum())
+            rec[f"concept_{n}_mean"] = mean
+            rec[f"concept_{n}_centred"] = mean - float(corpus_mean[j])
+            rec[f"concept_{n}_share"] = float(w[(nearest[m] == j) & assigned[m]].sum() / w.sum())
+        rows.append(rec)
+    chunk_tab = chunks[["chunk_id", "doc_id"]].copy().reset_index(drop=True)
+    for j, n in enumerate(names):
+        chunk_tab[f"sim_{n}"] = S[:, j]
+    chunk_tab["nearest_concept"] = [names[i] if a else "" for i, a in zip(nearest, assigned)]
+    pass_rows = []
+    text = chunks["chunk_text"].astype(str).to_numpy()
+    cids = chunks["chunk_id"].astype(str).to_numpy()
+    for j, n in enumerate(names):
+        for i in np.argsort(S[:, j])[::-1][:int(top_passages)]:
+            pass_rows.append({"concept": n, "similarity": float(S[i, j]), "doc_id": ids[i],
+                              "chunk_id": cids[i], "passage": text[i]})
+    return {"documents": pd.DataFrame(rows), "passages": pd.DataFrame(pass_rows), "chunks": chunk_tab}

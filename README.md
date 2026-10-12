@@ -1,8 +1,60 @@
-# PerspectiveMapper v3.2 — Corpus & Grouping Edition
+# PerspectiveMapper v3.3 — Doctrine & Concepts Edition
 
-PerspectiveMapper is a Streamlit application for multilingual, reproducible corpus, discourse, semantic and quantitative text analysis. Version 3.2 keeps the research modules from v3.1 and adds a substantially improved corpus-ingestion layer, global keyword filtering and result aggregation by metadata groups.
+PerspectiveMapper is a Streamlit application for multilingual, reproducible corpus, discourse, semantic and quantitative text analysis. Version 3.3 fixes several defects of v3.2, makes long-document corpora (such as papal encyclicals) faster and cleaner to process, and adds a concept-projection module for comparing a corpus with positions taken from another body of thought, for example economic theory.
 
-## What is new in v3.2
+## What is new in v3.3
+
+### Text preparation
+- **PDF/DOCX cleaning** (on by default): removes page numbers and running headers/footers (detected as lines that recur at the top or bottom of at least 40% of pages), rejoins words hyphenated at line ends and rebuilds paragraphs broken by hard wraps.
+- **Optional removal of the final notes section** (`NOTAS`, `NOTES`, `NOTE`…) and of `[n]` note markers, designed for vatican.va PDFs.
+- **Lemmatisation** with the `simplemma` dictionary lemmatiser for lexical analysis and topic models (`trabajadores` → `trabajador`). Embeddings, sentiment and dictionaries use the original text.
+- **Researcher-defined stopwords** from the sidebar.
+- Uploaded files are parsed once and cached, so changing a widget no longer re-reads every PDF.
+
+### Topic models
+- Topics can be estimated on **non-overlapping passages** and aggregated to documents as word-weighted means. `Automatic` uses passages when there are fewer than 30 documents or the median document exceeds 1,500 words.
+- Each topic now reports **NPMI coherence** (top-10 terms, co-occurrence within modelling units) and each model reports **topic diversity** (share of unique words among the top-25 terms per topic).
+- A **k-diagnostics** panel fits LDA and NMF over a range of k and plots coherence and diversity.
+- The topic slider now goes up to 30.
+
+### Dictionaries and concordance
+- Entries support a **within-word wildcard** (`salari*`, `*capital*`) and multi-word expressions that tolerate line breaks.
+- Matching is whole-word, case-insensitive and optionally accent-insensitive.
+- A **dictionary audit** lists the exact forms each entry matched, so false positives can be spotted before the indicators are used.
+- KWIC uses the same matching rules and keeps the original spelling in the output.
+
+### Concept projection (new tab)
+Define concepts with one or more anchor sentences, for example:
+
+```text
+free_market: free competition in the market allocates resources efficiently
+just_wage: wages must suffice for the decent livelihood of the worker and his family
+universal_destination: the goods of the earth are destined for all people
+```
+
+Each concept is the centroid of its anchor embeddings. For every passage the app computes cosine similarity to each concept and, per document, reports:
+
+- `concept_<name>_mean`: word-weighted mean similarity;
+- `concept_<name>_centred`: the same mean minus the corpus mean for that concept, so concepts with different baseline similarity can be compared;
+- `concept_<name>_share`: share of the document's words in passages whose nearest concept is this one with similarity above the chosen threshold.
+
+The closest passages to every concept are listed for validation. The three measures become outcomes in the grouped, temporal, two-group and regression tabs. Anchors can be written in a different language from the corpus because the embedding model is multilingual. This is a measure of semantic proximity, not of doctrinal agreement.
+
+### Fixes
+- Document similarity is now a true cosine similarity: v3.2 averaged unit-length passage embeddings without re-normalising them, which shrank similarities for documents with heterogeneous passages.
+- Sentiment document scores are word-weighted, so a short trailing passage no longer counts as much as a full one.
+- Silhouette scores are estimated on a fixed 3,000-unit subsample for large corpora (the exact computation is quadratic in the number of passages).
+- Bootstrap resampling is vectorised.
+- Deprecated `use_container_width` arguments replaced by `width="stretch"` (Streamlit ≥ 1.51).
+- `.streamlit/runtime.txt` contained the literal text `3.10\n` and was removed; `package.json`, a duplicate `config.toml`, the v2 app and two obsolete documents were removed too.
+- CSV/TXT files encoded in Windows-1252 are read correctly.
+- The Excel workbook is built on request instead of on every rerun.
+
+### Security
+- `.streamlit/secrets.toml` is no longer part of the project and is listed in `.gitignore`.
+- Passwords are compared in constant time and can be stored as `sha256:<hex>` hashes (see `.streamlit/secrets.toml.example`).
+
+## Features carried over from v3.2
 
 ### 1. Long Excel documents are reconstructed automatically
 Excel cells are limited to 32,767 characters, so long documents are often split across columns such as:
@@ -97,6 +149,7 @@ These results are described as lexicometric dictionary/framing indicators. They 
 - Document-topic mixtures.
 - Perplexity / reconstruction diagnostics.
 - Topic prevalence aggregated by metadata group.
+- Passage-level estimation, NPMI coherence, topic diversity and k diagnostics (v3.3).
 
 ### Semantic analysis
 - Multilingual embeddings with `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`.
@@ -193,11 +246,27 @@ Recommended setup:
 
 This allows topic, sentiment, lexical and temporal results to be analysed both by individual encyclical and by pontificate.
 
+Suggested workflow for comparing encyclicals with economic theory:
+
+1. Load the PDFs or the spreadsheet, keep text cleaning on and, for PDFs, remove the notes section if the notes are not part of the analysis.
+2. Turn lemmatisation on and add corpus-specific stopwords (forms of address, citation abbreviations).
+3. Leave the topic unit on `Automatic` (passages) and use the k diagnostics to choose a small set of candidate k values; then read the topics.
+4. Write a dictionary with wildcards for the economic vocabulary and check the audit table.
+5. Write anchor sentences for each theoretical position in the Concepts tab, read the closest passages, revise the anchors and only then use the concept measures by pope or year.
+6. Report the methodology table exported with the results.
+
 ## Run locally
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
+```
+
+Run the tests:
+
+```bash
+pip install pytest
+pytest -q
 ```
 
 The first semantic, sentiment or NER run downloads the corresponding Hugging Face model and caches it locally.
@@ -218,6 +287,9 @@ For limited-memory deployments, leave NER disabled unless actor/entity analysis 
 6. **Sentiment/dictionaries:** model and dictionary outputs are measurements, not ground truth.
 7. **Causal interpretation:** temporal trends, OLS coefficients and group differences are not automatically causal effects.
 
+8. **Concept projection:** similarity to anchor sentences depends on how the anchors are worded; report them in full and show validation passages.
+9. **Topic coherence:** NPMI is computed on the same units used to fit the model; it helps compare k values, it does not validate topic labels.
+
 ## Version
 
-PerspectiveMapper v3.2 Corpus & Grouping Edition.
+PerspectiveMapper v3.3 Doctrine & Concepts Edition.
